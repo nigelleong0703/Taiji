@@ -1,14 +1,14 @@
-# OpenSystemOne
+# Taiji 太极
 
-**A small, open System One model for agents: it decides and it writes, in one 2B model, and hands the hard cases to a
-System Two LLM.**
+**Fast intuition and slow reasoning, fused into one agent system.** Taiji-2B is an open System One model that decides
+and writes in a single 2B model, and hands the hard cases to any System Two LLM, the way yin and yang form one circle.
 
-OpenSystemOne-2B is Qwen3.5-2B with a LoRA and a decision head. Give it a state (text, JSON, a screenshot) and
+Taiji-2B is Qwen3.5-2B with a LoRA and a decision head. Give it a state (text, JSON, a screenshot) and
 questions with the options you allow; it returns calibrated probabilities over exactly those options in one forward
 pass, without generating answer tokens. The same model also writes short text, such as the value for a form field or
 a tool argument. When it is unsure, route the question to any larger LLM (System Two).
 
-Weights: [nigelleong0703/OpenSystemOne-2B](https://huggingface.co/nigelleong0703/OpenSystemOne-2B) ·
+Weights: [nigelleong0703/Taiji-2B](https://huggingface.co/nigelleong0703/Taiji-2B) ·
 Request format: compatible with the `/v1/systemone` choice / noul / score questions of
 [TypeSafe's Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) (independent project, not affiliated).
 
@@ -16,7 +16,7 @@ Request format: compatible with the `/v1/systemone` choice / noul / score questi
              state + questions (the allowed options)
                             │
                   ┌─────────▼─────────┐
-                  │   OpenSystemOne   │  one forward pass per decision
+                  │     Taiji-2B      │  one forward pass per decision
                   │  S1: decide/write │──► probabilities, confidence, text
                   └─────────┬─────────┘
                 confidence < threshold?
@@ -44,7 +44,7 @@ All numbers are our own measurements; setups are listed so they can be reproduce
 **General decisions vs hosted Jev.** Same 490 held-out questions (intent classification, yes/no, scoring, tool choice),
 same script (`jev_baseline.py`), same grading:
 
-| Questions | n | Jev (hosted) | OpenSystemOne-2B |
+| Questions | n | Jev (hosted) | Taiji-2B |
 |---|---|---|---|
 | All | 490 | 0.859 | **0.882** |
 | General choice | 248 | 0.891 | 0.899 |
@@ -53,7 +53,7 @@ same script (`jev_baseline.py`), same grading:
 | Tool choice | 116 | 0.871 | 0.914 |
 | Tool yes/no | 74 | 0.743 | 0.784 |
 
-The models disagree on 57 questions (OpenSystemOne right on 34, Jev on 23; McNemar p ≈ 0.19): **on par**, not a
+The models disagree on 57 questions (Taiji right on 34, Jev on 23; McNemar p ≈ 0.19): **on par**, not a
 proven win. These questions come from the same public datasets as part of our training data (held out), which favors
 our model.
 
@@ -74,17 +74,17 @@ data; see *Limitations*.
 Linux, Python 3.10+, an NVIDIA GPU with 8 GB or more.
 
 ```bash
-git clone https://github.com/nigelleong0703/OpenSystemOne && cd OpenSystemOne
+git clone https://github.com/nigelleong0703/Taiji && cd Taiji
 pip install -r requirements.txt
-hf download nigelleong0703/OpenSystemOne-2B --local-dir OpenSystemOne-2B
+hf download nigelleong0703/Taiji-2B --local-dir Taiji-2B
 # Optional speed-up for Qwen3.5's convolution layers (torch 2.14 + CUDA 12.6 build, sm 80/86/89/90):
-pip install --no-deps OpenSystemOne-2B/wheels/causal_conv1d-*.whl
+pip install --no-deps Taiji-2B/wheels/causal_conv1d-*.whl
 ```
 
 **Offline**, one JSONL line per request, decisions and text mixed:
 
 ```bash
-python infer.py --adapter OpenSystemOne-2B --data examples/requests.jsonl --output answers.jsonl
+python infer.py --adapter Taiji-2B --data examples/requests.jsonl --output answers.jsonl
 ```
 
 ```json
@@ -95,8 +95,8 @@ python infer.py --adapter OpenSystemOne-2B --data examples/requests.jsonl --outp
 **Server**: `POST /v1/systemone` decides, `POST /v1/chat/completions` with `"model": "s1"` writes.
 
 ```bash
-python check_cache.py Qwen/Qwen3.5-2B OpenSystemOne-2B some.png   # prints whether --shared-prefix is safe here
-S1_API_KEY=<long random string> python serve.py --base Qwen/Qwen3.5-2B --adapter OpenSystemOne-2B --shared-prefix
+python check_cache.py Qwen/Qwen3.5-2B Taiji-2B some.png   # prints whether --shared-prefix is safe here
+S1_API_KEY=<long random string> python serve.py --base Qwen/Qwen3.5-2B --adapter Taiji-2B --shared-prefix
 ```
 
 `--shared-prefix` reads the state once and answers every question of a request in one batch on it; `check_cache.py`
