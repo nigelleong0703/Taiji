@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.jsonl
+smoke/
+raw/
+data/
+runs/
+cache/
+hf/
+pip-cache/
+logs/
+COMMIT
+!examples/*.jsonl
+.pytest_cache/
