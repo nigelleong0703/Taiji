@@ -102,7 +102,7 @@ uv run --env-file .env python examples/run.py \
 - **Send visible text.** Offscreen article bodies and footers do not fill the model context.
 - **Reuse an interrupted text request.** A generated value survives a stale-page retry only if the entire text-helper input is unchanged.
 
-Every executed target is resolved from an observed node. The executor rechecks page freshness and click occlusion: click, select and fill decisions compare the target and its nearby context plus document/form state; DONE and BLOCKED compare the document, URL, scroll and form state. After three decisions in a row are voided by page changes, the loop waits briefly for the page to settle; after eight, System 2 takes the page. Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing.
+Every executed target is resolved from an observed node. The executor rechecks page freshness and click occlusion: click, select and fill decisions compare the target and its nearby context plus document/form state; DONE and BLOCKED compare the document, URL, scroll and form state. After three decisions in a row are voided by page changes, the loop waits briefly for the page to settle; after eight, System 2 takes the page. System 2 answers with a subgoal for the fast policy, a stop reason when the goal is infeasible, or done when the page already satisfies the goal (like a DONE choice, a claim to verify). Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing.
 
 ## Small enough to read
 

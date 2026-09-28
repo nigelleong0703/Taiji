@@ -529,3 +529,10 @@ def test_screenshot_is_sent_at_the_size_the_s1_server_uses():
     small = Image.open(io.BytesIO(base64.b64decode(model.shrink(base64.b64encode(out.getvalue()).decode()))))
     scale = (model.S1_IMAGE_PIXELS / (1120 * 780)) ** 0.5
     assert small.size == (int(1120 * scale), int(780 * scale))
+
+
+def test_system2_done_finishes_the_run(runner, monkeypatch):
+    monkeypatch.setattr(loop, "reflect", Mock(return_value=("done", "Cheapest results are shown", {"latency_ms": 1})))
+    runner.state["decision"] = {**decision("BLOCKED"), "operation": "BLOCKED"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done" and runner.state["reflections"][-1]["verdict"] == "done"

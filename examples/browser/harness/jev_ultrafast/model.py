@@ -312,7 +312,7 @@ def reflect(goal, page, history, trigger):
     content, meta = text_model(REFLECT, context, env="S2_MODEL")
     try:
         output = json.loads(content)
-        if set(output) != {"verdict", "text"} or output["verdict"] not in {"subgoal", "infeasible"}:
+        if set(output) != {"verdict", "text"} or output["verdict"] not in {"subgoal", "infeasible", "done"}:
             raise ValueError()
         if not isinstance(output["text"], str) or not output["text"].strip() or len(output["text"]) > 500:
             raise ValueError()

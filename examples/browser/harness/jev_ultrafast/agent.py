@@ -192,7 +192,7 @@ class Agent:
         return self.snapshot()
 
     def escalate(self, trigger):
-        """System 1 is stuck: ask System 2 for a language subgoal, or stop with its reason."""
+        """System 1 is stuck: ask System 2 for a language subgoal, or stop: finished, or infeasible with its reason."""
         state = self.state
         state.setdefault("reflections", [])
         if len(state["reflections"]) >= MAX_REFLECTIONS:
@@ -212,6 +212,8 @@ class Agent:
         state["reflected_at"] = len(state["history"])
         if verdict == "infeasible":
             state["status"], state["blocked_reason"] = "blocked", text
+        elif verdict == "done":  # like a DONE choice: claimed, not proven; callers verify the outcome
+            state["status"], state["plan_index"] = "done", 1
         else:
             state["subgoal"], state["status"] = text, "ready"
 
