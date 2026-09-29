@@ -40,6 +40,3 @@ BU_NAME=hidden BU_CDP_URL=http://127.0.0.1:9333 uv run --env-file my.env python 
 
 Results so far are in the main README (simple sites pass; Google Flights reaches the right results but does not yet
 declare completion).
-
-`teacher.py` / `teacher_round.sh`: an experiment that used a hosted Jev-compatible model as a teacher on varied sites
-(checked outcomes only). It was stopped: about 9% of runs passed, so it is kept for reference, not used for training.

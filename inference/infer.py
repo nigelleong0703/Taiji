@@ -1,6 +1,6 @@
 """Offline inference, no server: one model decides and writes field text.
 
-python infer.py --adapter <weights folder> --data requests.jsonl --output answers.jsonl [--base Qwen/Qwen3.5-2B]
+python inference/infer.py --adapter <weights folder> --data requests.jsonl --output answers.jsonl [--base Qwen/Qwen3.5-2B]
 
 Each input line is one of:
   {"state": ..., "questions": {...}}      decide: Jev choice / noul / score questions, as POST /v1/systemone

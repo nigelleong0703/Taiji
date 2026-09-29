@@ -1,6 +1,6 @@
 """Decides whether serve.py may use --shared-prefix: its scores must match the full sequence used in training.
 
-python check_cache.py <base> <adapter> <screenshot.png>
+python inference/check_cache.py <base> <adapter> <screenshot.png>
 Runs an image request, then a text-only one (catches a stale M-RoPE offset), and prints both timings.
 Compares calibrated probabilities and the top choice, the values serving acts on.
 Measured locally: identical in float32; in bf16 with PyTorch fallback kernels logits differed by up to 0.5,

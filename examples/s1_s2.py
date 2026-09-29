@@ -6,7 +6,7 @@ S1_URL=http://localhost:8000 S1_API_KEY=... [S2_BASE_URL=... S2_API_KEY=... S2_M
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "inference"))
 from client import S1, S2  # noqa: E402
 
 s1 = S1(os.environ.get("S1_URL", "http://localhost:8000"), os.environ["S1_API_KEY"])
