@@ -155,7 +155,11 @@ def main():
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="row-encoding processes")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--init", help="start from a trained LoRA run (adapter_model.safetensors + head.pt, same --lora-r and "
+                                  "--head), e.g. to continue S1 v3 on new data; a resumed run's own checkpoint wins")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--length-group", type=int, default=16,
+                   help="sort this many steps' rows by length and give each step similar lengths (less padding); 1 = off")
     args = p.parse_args()
 
     distributed = "WORLD_SIZE" in os.environ
@@ -187,11 +191,18 @@ def main():
         from transformers import AutoTokenizer
 
         model.head.init_from_lm(model.generator().lm_head.weight, *yes_no_ids(AutoTokenizer.from_pretrained(args.base)))
+    if args.init and not (args.resume and checkpoint.exists()):
+        set_peft_model_state_dict(lm, load_file(Path(args.init) / "adapter_model.safetensors"))
+        model.head.load_state_dict(torch.load(Path(args.init) / "head.pt", map_location=device))
+        if rank == 0:
+            print(f"initialized from {args.init}", flush=True)
     if rank == 0:
         count = sum(q.numel() for q in lm.parameters() if q.requires_grad)
         print(f"trainable language-model parameters: {count:,} of {sum(q.numel() for q in lm.parameters()):,}")
 
     offsets = read_rows(args.train)
+    # Row size in bytes, a free proxy for its token count (read_rows already has every line's offset).
+    sizes = [b - a for a, b in zip(offsets, offsets[1:] + [os.path.getsize(args.train)])]
     per_epoch = len(offsets) // (args.accum * world)
     total_steps = max(1, math.ceil(per_epoch * args.epochs))
     lm_params = [q for q in lm.parameters() if q.requires_grad]
@@ -232,6 +243,7 @@ def main():
         print(f"{len(offsets)} rows, {world} GPU(s), {total_steps} optimizer steps of {rows_per_step} rows", flush=True)
 
     loss_sum = correct = seen = skipped = tokens = text_loss_sum = text_seen = 0
+    timing = collections.Counter()  # seconds per log window: waiting for encoded rows, GPU work, optimizer; padding
     stats = collections.defaultdict(lambda: [0, 0])
     started, start_step, fallback = time.time(), step, None
     stop = min(total_steps, start_step + args.max_steps) if args.max_steps else total_steps
@@ -243,6 +255,16 @@ def main():
         order = order[rank::world][: per_epoch * args.accum]
         todo = order[micro % len(order):]
         windows = [todo[i:i + args.accum] for i in range(0, len(todo), args.accum)]  # one optimizer step each
+        if args.length_group > 1:
+            # A 300-token row padded to a 6,000-token one wastes the GPU (43% of all tokens were padding). Sort each
+            # span of --length-group steps by size and hand every step similar lengths, in shuffled step order;
+            # each step still has --accum rows, so the loss scale is unchanged. As group_by_length in HF Trainer.
+            span, windows = args.length_group * args.accum, []
+            for start in range(0, len(todo), span):
+                chunk = sorted(todo[start:start + span], key=lambda i: sizes[i])
+                group = [chunk[i:i + args.accum] for i in range(0, len(chunk), args.accum)]
+                random.Random(hash((args.seed, epoch, start))).shuffle(group)
+                windows += group
 
         def submit(window, epoch=epoch):  # the next step's rows encode in the workers while this step trains
             return [pool.submit(_encode, (row_at(args.train, offsets[i]), args.max_len, args.image_tokens,
@@ -252,7 +274,10 @@ def main():
         for number_window, window in enumerate(windows):
             futures, pending = pending, (submit(windows[number_window + 1]) if number_window + 1 < len(windows)
                                          else [])
+            waited = time.time()
             rows = [f.result() for f in futures]
+            timing["wait_s"] += time.time() - waited
+            computed = time.time()
             skipped += sum(e is None for e in rows)
             rows = [e for e in rows if e is not None]
             micro += len(window)
@@ -262,6 +287,8 @@ def main():
                 rows = [{**fallback, "weight": 0.0}]
             batches = pack(rows, args.batch_tokens)
             for number, batch in enumerate(batches):
+                timing["real_tokens"] += sum(len(e["input_ids"]) for e in batch)
+                timing["padded_tokens"] += len(batch) * -(-max(len(e["input_ids"]) for e in batch) // 256) * 256
                 last = number == len(batches) - 1
                 sync = trainable.no_sync() if distributed and not last else contextlib.nullcontext()
                 with sync, torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.full):
@@ -280,10 +307,14 @@ def main():
                         loss_sum += loss.item()
                         correct += tally(stats, e, out)
                         seen += 1
+            torch.cuda.synchronize()
+            timing["compute_s"] += time.time() - computed
+            stepped = time.time()
             torch.nn.utils.clip_grad_norm_(lm_params + list(model.head.parameters()), 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            timing["optimizer_s"] += time.time() - stepped
             step += 1
             if rank == 0 and step % args.log_every == 0:
                 elapsed = time.time() - started
@@ -295,11 +326,14 @@ def main():
                                   "recent_tokens_per_s": round((tokens - last_log[1]) / (time.time() - last_log[0])),
                                   "lr": scheduler.get_last_lr()[0],
                                   "max_mem_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1),
+                                  "time_s": {k: round(timing[k], 1) for k in ("wait_s", "compute_s", "optimizer_s")},
+                                  "pad_share": round(1 - timing["real_tokens"] / max(timing["padded_tokens"], 1), 3),
                                   "eta_h": round(elapsed / (step - start_step) * (total_steps - step) / 3600, 2),
                                   "acc_by": {k: round(v[0] / v[1], 2) for k, v in sorted(stats.items())}}),
                       flush=True)
                 loss_sum = correct = seen = text_loss_sum = text_seen = 0
                 stats.clear()
+                timing.clear()
                 last_log = (time.time(), tokens)
             if rank == 0 and eval_rows and (step % args.eval_every == 0 or step == total_steps):
                 print(json.dumps({"eval_step": step, **evaluate(model, eval_rows, args)}), flush=True)

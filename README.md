@@ -135,6 +135,19 @@ text = s1.write({"goal": "...", "field": {"label": "Where from?"}})
   WAIT/BLOCKED 1,500 and SELECT 2,952, completion rows derived from WebLINX 1,420, with rare operations repeated up to
   8% of operation rows.
 
+### Next round (in progress, not trained yet)
+
+- More agent data in the same request format: `prepare_axtree.py` converts released trajectories with accessibility
+  trees, [NNetNav-live](https://huggingface.co/datasets/stanfordnlp/nnetnav-live) (Apache-2.0, 54k rows) and
+  [AgentTrek](https://huggingface.co/datasets/xlangai/AgentTrek) (no license stated; research use, 46k rows), including
+  about 9,800 completion (DONE) steps; `prepare_valen.py` adds screen-reading questions from Valen's RICO-ScreenQA and
+  ShowUI desktop sets (28.5k rows with screenshots).
+- `mix_round.sh` builds a mix; `train_v4.sh` continues training from this model (`train.py --init`) and calibrates.
+- Training speed: `train.py --length-group` gives each step rows of similar length. On real rows it cut padding from
+  about 45% to 15-20% of the tokens and raised throughput about 1.5x (measured on an A40).
+- `runpod_job.py` runs any of the `*_round.sh` / `speed_probe.sh` jobs on RunPod (creates the pod, saves its logs,
+  deletes it). Results will be added here only once measured.
+
 ## Limitations
 
 - **Research use only.** WebLINX is CC BY-NC-SA 4.0, so the weights are released under CC BY-NC-SA 4.0. The code in

@@ -29,9 +29,13 @@ def rows_from_trace(trace):
             state = decision["request"]["state"]
             action = next((c for q in decision["request"]["questions"].values() for c in q["criteria"].values()
                            if isinstance(c, dict) and c.get("element", "").endswith(step["action"])), {})
+            # As agent_format.field_context builds it: the other fillable fields and their values sit beside the field.
+            others = [{"label": e["label"], "value": e.get("value", "")} for e in state.get("elements", [])
+                      if "TYPE_TEXT" in e.get("operations", []) and not step["action"].endswith(e["label"])]
             context = {
                 "goal": trace["goal"],
                 "field": {"label": step["action"], "role": action.get("role"), "value": action.get("current_value")},
+                "form_fields": others[:12],
                 "page": {"title": state["page"]["title"], "text": state["page"]["text"][:6000]},
                 "recent_actions": [{"action": a.get("action"), "text": a.get("text")} for a in
                                    trace["history"][max(0, step["step"] - 7) : step["step"] - 1]],
@@ -47,7 +51,10 @@ def rows_from_trace(trace):
         for name in heads:
             question, answer = request["questions"].get(name), answers.get(name)
             if question and answer and answer.get("choice") in question["criteria"]:
-                yield {"state": request["state"], "question": question, "label": answer["choice"], "host": host}
+                row = {"state": request["state"], "question": question, "label": answer["choice"], "host": host}
+                if decision.get("image"):  # teacher.py: the screenshot this decision saw
+                    row["image"] = decision["image"]
+                yield row
 
 
 def main():
@@ -56,13 +63,16 @@ def main():
     p.add_argument("--out", required=True, help="folder for train.jsonl and val.jsonl")
     p.add_argument("--val-fraction", type=float, default=0.1, help="share of hosts held out")
     p.add_argument("--only-done", action="store_true", help="skip traces whose status is not done")
+    p.add_argument("--only-success", action="store_true", help="skip traces whose independent check failed (teacher.py)")
     args = p.parse_args()
 
-    files = [f for t in map(Path, args.traces) for f in ([t] if t.is_file() else t.rglob("state.json"))]
+    files = [f for t in map(Path, args.traces) for f in ([t] if t.is_file() else [*t.rglob("state.json"), *t.rglob("traces/*.json")])]
     rows = []
     for f in files:
         trace = json.loads(f.read_text())
         if args.only_done and trace.get("status") != "done":
+            continue
+        if args.only_success and not trace.get("success"):
             continue
         rows.extend(rows_from_trace(trace))
     hosts = sorted({r["host"] for r in rows})
