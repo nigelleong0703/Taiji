@@ -39,7 +39,7 @@ The v3 weights were fine-tuned on a mixture of WebLINX, Multimodal-Mind2Web, Ope
 
 ## Training procedure
 
-The model uses LoRA rank 16 on the language model, a task-specific decision head, and a frozen vision encoder. Training combines cross-entropy and a Brier loss term, label smoothing, and weighted text rows. Temperature calibration is applied after fine-tuning. Reproducible commands and configuration are in [reproduction notes](https://github.com/nigelleong0703/Taiji/blob/main/docs/reproduction.md) and the repository's `train_v3.sh` / `calibrate.py`.
+The model uses LoRA rank 16 on the language model, a task-specific decision head, and a frozen vision encoder. Training combines cross-entropy and a Brier loss term, label smoothing, and weighted text rows. Temperature calibration is applied after fine-tuning. Training used one epoch over 60,395 mixed rows, followed by temperature calibration. The public release contains inference and evaluation material; dataset preparation and training scripts are not included here.
 
 ## Evaluation
 

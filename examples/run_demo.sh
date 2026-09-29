@@ -10,6 +10,6 @@ if [[ ! -d "$ADAPTER" ]]; then
 fi
 OUTPUT="$(mktemp "${TMPDIR:-/tmp}/taiji-demo.XXXXXX.jsonl")"
 trap 'rm -f "$OUTPUT"' EXIT
-python "$ROOT/infer.py" --base "$BASE" --adapter "$ADAPTER" \
+python "$ROOT/inference/infer.py" --base "$BASE" --adapter "$ADAPTER" \
   --data "$ROOT/examples/requests.jsonl" --output "$OUTPUT"
 cat "$OUTPUT"
