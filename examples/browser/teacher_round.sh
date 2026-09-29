@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pod job: teacher runs in headless Chrome (no desktop), then rows into the private HF dataset.
-# CODE_B64: teacher.py, agent_eval.py, prepare.py + harness/ (jev-ultrafast). ENV_B64: the agent env (TYPESAFE_*, TEXT_MODEL_*,
+# CODE_B64: teacher.py, agent_eval.py, prepare.py + harness/ (this repo's agent/). ENV_B64: the agent env (TYPESAFE_*, TEXT_MODEL_*,
 # S2_MODEL_*; S2 also judges InSTA runs). HF_TOKEN, HF_DATA_REPO. WORKERS (default 4), LIMIT (tasks per worker, 0 = all),
 # INSTA (InSTA-150k tasks added to the hand-checked ones), ONLY (comma-separated task ids: rerun just these).
 # Log on port 8888; ends with TEACHER_DONE or <STEP>_FAILED.
