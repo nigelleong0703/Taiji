@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use Taiji-2B in research, please cite the repository and model."
+title: "Taiji-2B: Fast System One Decisions and Structured Text"
+authors:
+  - family-names: Leong
+    given-names: Nigel
+repository-code: "https://github.com/nigelleong0703/Taiji"
+url: "https://huggingface.co/nigelleong0703/Taiji-2B"
+license: Apache-2.0
