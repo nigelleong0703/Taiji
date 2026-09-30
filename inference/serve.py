@@ -28,6 +28,11 @@ PREFIXES = OrderedDict()
 
 
 def answer(processor, model, body, args):
+    if getattr(args, "backend", "transformers") == "vllm":
+        state, questions = body.get("state"), body.get("questions")
+        if not isinstance(state, (str, dict, list)) or not isinstance(questions, dict):
+            raise ValueError("state must be text, an object or a list; questions must be an object")
+        return model.decide(state, questions)
     state = body["state"]  # text, object or list; a screenshot rides in state["screenshot"] or body["screenshot"]
     if not isinstance(state, (str, dict, list)) or not isinstance(body["questions"], dict):
         raise ValueError("state must be text, an object or a list; questions must be an object")
@@ -117,13 +122,19 @@ def complete(processor, model, body, args):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--backend", choices=("transformers", "vllm"), default="transformers")
     p.add_argument("--base", default="Qwen/Qwen3.5-4B")
-    p.add_argument("--adapter", required=True)
+    p.add_argument("--adapter", help="Transformers backend adapter or full fine-tune")
+    p.add_argument("--model", help="exported Taiji checkpoint for the vLLM backend")
+    p.add_argument("--head-bundle", help="directory containing the exported Taiji head")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--max-len", type=int, default=8192)
     p.add_argument("--image-tokens", type=int, default=400)
-    p.add_argument("--name", default="s1")
+    p.add_argument("--name")
+    p.add_argument("--dtype", default="bfloat16", help="vLLM model dtype")
+    p.add_argument("--gpu-memory-utilization", type=float)
+    p.add_argument("--max-num-batched-tokens", type=int)
     p.add_argument("--plain-chat", action="store_true",
                    help="keep the LoRA unmerged so other model names get the base model (slower decisions)")
     p.add_argument("--shared-prefix", action="store_true",
@@ -133,9 +144,31 @@ def main():
     if not key:
         raise SystemExit("Set S1_API_KEY; this endpoint is reachable from the internet on Vast.")
 
-    # Merged LoRA runs no extra adapter matmuls; only plain chat needs it unmerged, to switch it off per request.
-    processor, model = load(args.base, args.adapter, merge=not args.plain_chat)
-    model.eval()
+    if args.name is None:
+        args.name = "taiji-vllm" if args.backend == "vllm" else "s1"
+    if args.backend == "vllm":
+        if not args.model:
+            p.error("--backend vllm requires --model pointing to an exported Taiji checkpoint")
+        if args.plain_chat or args.shared_prefix:
+            p.error("--plain-chat and --shared-prefix apply only to the Transformers backend")
+        from vllm_backend import TaijiVLLM
+
+        engine_kwargs = {"max_model_len": args.max_len, "dtype": args.dtype,
+                         "enable_prefix_caching": True}
+        if args.gpu_memory_utilization is not None:
+            engine_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
+        if args.max_num_batched_tokens is not None:
+            engine_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+        processor = None
+        model = TaijiVLLM(args.model, args.head_bundle or args.model, max_len=args.max_len,
+                          engine_kwargs=engine_kwargs)
+        model.load_engine()
+    else:
+        if not args.adapter:
+            p.error("--backend transformers requires --adapter")
+        # Merged LoRA runs no extra adapter matmuls; only plain chat needs it unmerged, to switch it off per request.
+        processor, model = load(args.base, args.adapter, merge=not args.plain_chat)
+        model.eval()
     lock = threading.Lock()  # one GPU, one request at a time
 
     class Handler(BaseHTTPRequestHandler):
@@ -154,6 +187,8 @@ def main():
             routes = {"/v1/systemone": answer, "/v1/chat/completions": complete}
             if self.path not in routes:
                 return self.send(404, {"error": "not found"})
+            if args.backend == "vllm" and self.path == "/v1/chat/completions":
+                return self.send(501, {"error": "chat completions require --backend transformers"})
             if not hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {key}"):
                 return self.send(401, {"error": "unauthorized"})
             length = int(self.headers.get("Content-Length") or 0)
@@ -166,13 +201,14 @@ def main():
                     result = routes[self.path](processor, model, body, args)
                 result["latency_ms"] = round((time.perf_counter() - started) * 1000)
                 self.send(200, result)
-            except (ValueError, KeyError, TypeError, StopIteration, json.JSONDecodeError) as error:
+            except (ValueError, KeyError, TypeError, StopIteration, NotImplementedError,
+                    json.JSONDecodeError) as error:
                 self.send(400, {"error": str(error)})
 
         def log_message(self, *_):
             pass
 
-    print(f"S1 listening on {args.host}:{args.port} (temperature {model.temperature})", flush=True)
+    print(f"Taiji {args.backend} backend listening on {args.host}:{args.port}", flush=True)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 

@@ -7,7 +7,6 @@ import torch
 from vllm_backend import (
     answer_from,
     answers_from_scores,
-    as_flat_floats,
     confidence,
     score_token_states,
     temperature_for,
@@ -57,12 +56,6 @@ def test_temperature_by_kind_overrides_global():
     assert base == {"1": pytest.approx(1 / 3), "2": pytest.approx(1 / 3), "3": pytest.approx(1 / 3)}
     assert temperature_for("choice", 1.0, {"choice": 0.5}) == 0.5
     assert temperature_for("noul", 1.0, {"choice": 0.5}) == 1.0
-
-
-def test_as_flat_floats_handles_nested_and_tensor():
-    assert as_flat_floats([0.1, 0.2]) == [0.1, 0.2]
-    assert as_flat_floats([[0.1], [0.2, 0.3]]) == pytest.approx([0.1, 0.2, 0.3])
-    assert as_flat_floats(torch.tensor([1.0, 2.0])) == [1.0, 2.0]
 
 
 def test_trained_head_scores_vllm_token_states_at_compiled_offsets():

@@ -5,7 +5,7 @@ the compiled option markers and final query token, then turns those logits into 
 calibrated `choice` / `noul` / `score` answers as the S1 Transformers server. Prompts are
 passed as `prompt_token_ids`, preserving the compiled read-out positions.
 
-The pure helpers (`answer_from`, `answers_from_scores`, `as_flat_floats`) are CPU-testable;
+The pure helpers (`answer_from`, `answers_from_scores`) are CPU-testable;
 only `TaijiVLLM` touches vLLM, which is imported lazily so this module and its tests run
 without CUDA. Image questions need the multimodal path and are not handled here yet.
 """
@@ -62,23 +62,6 @@ def answers_from_scores(questions, keys_and_logits, temperature=DEFAULT_TEMPERAT
     return answers
 
 
-def as_flat_floats(data):
-    """vLLM pooling output -> flat list[float], for output shapes that may be nested."""
-    if isinstance(data, torch.Tensor):
-        return [float(x) for x in data.reshape(-1)]
-    flat = []
-
-    def walk(value):
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                walk(item)
-        else:
-            flat.append(float(value))
-
-    walk(data)
-    return flat
-
-
 def score_token_states(head, hidden_states, compiled, hidden_size):
     """Apply Taiji's trained head to vLLM's complete per-token hidden-state output."""
     hidden = torch.as_tensor(hidden_states)
@@ -126,7 +109,8 @@ class TaijiVLLM:
         self.by_kind = by_kind if by_kind is not None else meta.get("temperature_by_kind", {})
         self._llm = None
 
-    def _build(self):
+    def load_engine(self):
+        """Register Taiji's model and start the vLLM pooling engine once."""
         if self._llm is not None:
             return self._llm
         from vllm import LLM
@@ -157,7 +141,7 @@ class TaijiVLLM:
         """
         compiled = self.compile(questions, state)
         prompts = [{"prompt_token_ids": c["input_ids"]} for c in compiled]
-        outputs = self._build().encode(prompts, pooling_params=self._pooling_params)
+        outputs = self.load_engine().encode(prompts, pooling_params=self._pooling_params)
         if len(outputs) != len(compiled):
             raise RuntimeError("vLLM returned a different number of outputs than prompts")
         results = []
@@ -187,7 +171,6 @@ __all__ = [
     "TaijiVLLM",
     "answer_from",
     "answers_from_scores",
-    "as_flat_floats",
     "confidence",
     "score_token_states",
     "temperature_for",

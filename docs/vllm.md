@@ -44,14 +44,14 @@ register()
 
 ## Serve decisions
 
-`inference/vllm_serve.py` exposes the same `POST /v1/systemone` contract as the Transformers server, so a browser agent can point `TYPESAFE_URL` at this port unchanged:
+Use the existing Taiji server with the vLLM backend; the `/v1/systemone` route stays the same, so the browser agent can point `TYPESAFE_URL` at this port unchanged:
 
 ```bash
-S1_API_KEY='<long-random-secret>' python inference/vllm_serve.py \
-  --model taiji-vllm --head-bundle taiji-vllm --host 0.0.0.0 --port 8000
+S1_API_KEY='<long-random-secret>' python inference/serve.py --backend vllm \
+  --model taiji-vllm --host 0.0.0.0 --port 8000
 ```
 
-The Taiji server uses vLLM's `LLM.encode` token-embedding task, checks that returned prompt ids and hidden-state shapes match the compiled requests, then runs `YesNoHead` over the marker and query rows. This extra scoring step is required because each request can have a different number of candidate options and Taiji's trained head has a learned residual network.
+The existing server uses vLLM's `LLM.encode` token-embedding task, checks that returned prompt ids and hidden-state shapes match the compiled requests, then runs `YesNoHead` over the marker and query rows. This extra scoring step is required because each request can have a different number of candidate options and Taiji's trained head has a learned residual network. The vLLM backend serves decisions; chat completion remains on the Transformers backend.
 
 ## Reading out, and how parity is checked
 

@@ -6,7 +6,7 @@ compares every option endpoint against the global query (the final `Decision:` t
 
 `YesNoHead` / `CandidateHead` below are behaviour-identical copies of the modules in
 `inference/s1.py`. They are duplicated on purpose so the vLLM backend depends only on a
-small, framework-free module, and `vllm_tests/test_vllm_parity.py` asserts numerically that
+small, framework-free module, and `vllm_tests/test_vllm_head.py` asserts numerically that
 they match the originals. Do not "simplify" this into a generic linear classifier: the
 trained checkpoint's `train_args.json` records `head: "yesno"`, and a plain linear or
 next-token score is a different model.
@@ -128,19 +128,6 @@ def score_at(head, hidden_states, positions, query_index):
     return head(candidates, hidden_states[query_index])
 
 
-def split_packed_hidden_states(hidden_states, lengths):
-    """Split vLLM's contiguous, variable-length sequence rows by token counts."""
-    lengths = [int(length) for length in lengths]
-    if any(length < 0 for length in lengths):
-        raise ValueError("hidden-state lengths must be non-negative")
-    if sum(lengths) != hidden_states.shape[0]:
-        raise ValueError(
-            f"packed hidden-state rows ({hidden_states.shape[0]}) do not match "
-            f"the supplied sequence lengths ({sum(lengths)})"
-        )
-    return list(torch.split(hidden_states, lengths, dim=0))
-
-
 def read_head_bundle(path):
     """Load a Taiji head bundle written by `vllm_export.py`.
 
@@ -174,5 +161,4 @@ __all__ = [
     "score_at",
     "score_sequence",
     "softmax_with_temperature",
-    "split_packed_hidden_states",
 ]

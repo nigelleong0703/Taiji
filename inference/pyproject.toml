@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 
 [project.entry-points."vllm.general_plugins"]
-taiji = "vllm_plugin:register"
+taiji = "vllm_model:register"
 
 [tool.setuptools]
-py-modules = ["vllm_head", "vllm_prompt", "vllm_model", "vllm_plugin", "vllm_backend", "vllm_serve"]
+py-modules = ["vllm_head", "vllm_prompt", "vllm_model", "vllm_backend"]

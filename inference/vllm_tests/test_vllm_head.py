@@ -14,7 +14,6 @@ from vllm_head import (
     score_at,
     score_sequence,
     softmax_with_temperature,
-    split_packed_hidden_states,
 )
 
 MARKER_ID = 2_000_000
@@ -78,18 +77,6 @@ def test_head_logits_matches_index_select_and_query():
 def test_softmax_temperature_matches_manual():
     logits = torch.tensor([0.5, -1.0, 2.0])
     assert torch.allclose(softmax_with_temperature(logits, 0.7), torch.softmax(logits / 0.7, -1))
-
-
-def test_split_packed_hidden_states_handles_mixed_sequence_lengths():
-    packed = torch.arange(7 * 3).reshape(7, 3)
-    rows = split_packed_hidden_states(packed, [2, 5])
-    assert [row.shape[0] for row in rows] == [2, 5]
-    assert torch.equal(torch.cat(rows), packed)
-
-
-def test_split_packed_hidden_states_rejects_bad_lengths():
-    with pytest.raises(ValueError, match="do not match"):
-        split_packed_hidden_states(torch.zeros(4, 3), [2, 3])
 
 
 def test_build_head_and_bundle_round_trip(tmp_path):
