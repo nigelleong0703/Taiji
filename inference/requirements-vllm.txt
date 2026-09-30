@@ -1,0 +1,11 @@
+# vLLM backend for Taiji decisions (Linux + NVIDIA GPU only).
+#
+# Kept separate from inference/requirements.txt, which pins the CUDA 12.6 torch build used by
+# the S1 transformers server (torch==2.14.0+cu126). vLLM pins its own torch and transformers,
+# so install this file into a dedicated environment instead of mixing it with the S1 runtime.
+#
+#   pip install -r inference/requirements-vllm.txt
+#
+# The exporter (inference/vllm_export.py) additionally needs the S1 runtime packages
+# (transformers, peft, safetensors, pillow) from inference/requirements.txt.
+vllm==0.29.0
