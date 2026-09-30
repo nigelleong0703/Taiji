@@ -18,6 +18,10 @@ hf download nigelleong0703/Taiji-2B --local-dir Taiji-2B
 
 The offline demo runs [`inference/infer.py`](inference/infer.py) on [`examples/requests.jsonl`](examples/requests.jsonl) and prints decision and field-writing results. For a long-running HTTP service, see the [inference guide](docs/inference.md).
 
+## General S1/S2 agent
+
+Taiji includes a shared [MCP agent runtime](agent_runtime/README.md): S1 makes fast tool choices, S2 handles planning and native tool calls, and registered MCP servers supply the tools. Browser control is available through an MCP adapter in the same runtime, alongside other tool servers.
+
 ## Browser demo
 
 The browser agent is an optional integration, not a model requirement. Its recorded demo and run instructions are in [`examples/browser`](examples/browser/README.md).
@@ -30,6 +34,7 @@ The agent passed 6/6 simple-site tasks. Google Flights completion detection rema
 
 - [`MODEL_CARD.md`](MODEL_CARD.md): intended use, limitations, data, evaluation, and licensing.
 - [`inference/`](inference/): model implementation, offline runner, HTTP service, Python client, and runtime dependencies.
+- [`agent_runtime/`](agent_runtime/): MCP tool discovery, the shared S1/S2 loop, and browser adapter.
 - [`examples/`](examples/): runnable JSONL requests, S1/S2 integration, and optional browser integration.
 - [`docs/`](docs/): inference instructions and reported evaluation details.
 - [`CITATION.cff`](CITATION.cff): citation metadata.
