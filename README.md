@@ -18,6 +18,46 @@ hf download nigelleong0703/Taiji-2B --local-dir Taiji-2B
 
 The offline demo runs [`inference/infer.py`](inference/infer.py) on [`examples/requests.jsonl`](examples/requests.jsonl) and prints decision and field-writing results. For a long-running HTTP service, see the [inference guide](docs/inference.md).
 
+## Serve with vLLM in FP8 (8 GB GPU)
+
+The fast path for agents: one patched vLLM 0.29.0 engine serves decisions (`/v1/systemone`) and field writing (`/v1/chat/completions`) from FP8 weights. Measured on an RTX 4060 Laptop: ~6.9 GB GPU memory, decision latency p50/p90 297/458 ms cold and ~213/240 ms with a cached prefix. Weights: [nigelleong0703/Taiji-2B](https://huggingface.co/nigelleong0703/Taiji-2B) (LoRA adapter + decision head on [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B)).
+
+Use two Python environments: the exporter needs `transformers`/`peft`, while vLLM pins its own torch and transformers.
+
+```bash
+# 1. Export: merge the LoRA into the base model and package the decision head.
+python3 -m venv .venv-export
+.venv-export/bin/pip install -r inference/requirements.txt
+.venv-export/bin/hf download nigelleong0703/Taiji-2B --local-dir Taiji-2B --exclude 'wheels/*'
+.venv-export/bin/python inference/vllm_export.py --base Qwen/Qwen3.5-2B --adapter Taiji-2B \
+  --out taiji-vllm --dtype bfloat16
+# Check: taiji-vllm/ contains taiji_head.pt and taiji_config.json.
+
+# 2. Runtime: vLLM, the Taiji model plugin, and the source patch (engine stopped).
+python3.12 -m venv .venv-vllm
+.venv-vllm/bin/pip install -r inference/requirements-vllm.txt   # CUDA 13.0 hosts: requirements-vllm-cu130.txt
+.venv-vllm/bin/pip install --no-deps -e ./inference
+.venv-vllm/bin/python inference/vllm_patch/apply.py
+# Check: it exits without error; it refuses any vLLM other than 0.29.0. Undo with --restore.
+
+# 3. Serve in FP8 (vision tower and lm_head stay unquantized; CUDA graphs on).
+export S1_API_KEY='<long-random-secret>'   # required; clients send Authorization: Bearer $S1_API_KEY
+.venv-vllm/bin/python -u inference/serve.py --backend vllm --model taiji-vllm \
+  --host 0.0.0.0 --port 8010 --max-len 262144 \
+  --gpu-memory-utilization 0.92 --max-num-batched-tokens 8192 --max-num-seqs 4 \
+  --quantization fp8_per_tensor --quantization-config '{"ignore":["*visual*","*lm_head*"]}' \
+  --mm-max-pixels 409600
+
+# 4. Verify.
+curl http://localhost:8010/health
+# -> {"ok": true, "model": ..., "max_model_len": 262144, "quantization": "fp8_per_tensor", "cpu_offload_gb": 0}
+# Optional, with the server stopped: cold/cached decisions and generation in one engine.
+head -1 examples/requests.jsonl > request.json
+.venv-vllm/bin/python inference/vllm_patch/integration_test.py --model taiji-vllm --request request.json
+```
+
+CUDA 13.0 toolkit setup (`CUDA_HOME`, nvcc/ninja on PATH), what the patch changes, the request contract, and tuning notes are in [docs/vllm.md](docs/vllm.md).
+
 ## General S1/S2 agent
 
 Taiji includes a shared [MCP agent runtime](agent_runtime/README.md): S1 makes fast tool choices, S2 handles planning and native tool calls, and registered MCP servers supply the tools. Browser control is available through an MCP adapter in the same runtime, alongside other tool servers.

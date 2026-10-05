@@ -70,8 +70,9 @@ On a GPU host, after the patch is installed, the end-to-end test exercises cold 
 cached decisions, mixed batches, and field generation:
 
 ```bash
+head -1 examples/requests.jsonl > request.json   # any single {"state", "questions"} request
 python inference/vllm_patch/integration_test.py \
-  --model /path/to/taiji-vllm --request examples/req155.json
+  --model /path/to/taiji-vllm --request request.json
 ```
 
 The installed marker is `GPUModelRunner.TAIJI_READOUT_PATCH_VERSION == 1`, set on both
@@ -182,7 +183,7 @@ decision, and that no second engine exists:
 
 ```bash
 vllm-env/bin/python inference/vllm_patch/integration_test.py \
-  --model hf/taiji-vllm --request req155.json --chunk-tokens 512 \
+  --model hf/taiji-vllm --request request.json --chunk-tokens 512 \
   --output shared-engine-result.json
 ```
 
