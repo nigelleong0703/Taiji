@@ -1,0 +1,329 @@
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -147,6 +147,7 @@
+         *,
+         kv_transfer_params: dict[str, Any] | None = None,
+         ec_transfer_params: dict[str, Any] | None = None,
++        taiji_scores: list[float] | None = None,
+         # Forward compatibility, code that uses args added in new release can
+         # still run with older versions of vLLM without breaking.
+         **kwargs: Any,
+@@ -169,11 +170,14 @@
+         self.num_cache_creation_tokens = num_cache_creation_tokens
+         self.kv_transfer_params = kv_transfer_params
+         self.ec_transfer_params = ec_transfer_params
++        self.taiji_scores = taiji_scores
+ 
+     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
+         """Merge subsequent RequestOutput into this one"""
+ 
+         self.finished |= next_output.finished
++        if next_output.taiji_scores is not None:
++            self.taiji_scores = next_output.taiji_scores
+         self.kv_transfer_params = next_output.kv_transfer_params
+         self.ec_transfer_params = next_output.ec_transfer_params
+ 
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -256,6 +256,16 @@
+         # num_computed_tokens to be block-size aligned. Removing this limitation
+         # could slightly improve performance in the future.
+         max_cache_hit_length = request.num_tokens - 1
++        if request.sampling_params is not None:
++            readout = (request.sampling_params.extra_args or {}).get("taiji_readout")
++            if readout is not None:
++                from vllm.model_executor.layers.taiji_readout import validate_spec
++
++                validate_spec(readout, request.prompt_token_ids)
++                max_cache_hit_length = min(
++                    max_cache_hit_length,
++                    min(*readout["positions"], readout["query_index"]),
++                )
+         computed_blocks, num_new_computed_tokens, num_uncached = (
+             self.coordinator.find_longest_cache_hit(
+                 request.block_hashes, max_cache_hit_length
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1809,6 +1809,7 @@
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+         pooler_outputs = model_runner_output.pooler_output
++        taiji_scores_by_request = model_runner_output.taiji_scores or {}
+         num_nans_in_logits = model_runner_output.num_nans_in_logits
+         kv_connector_output = model_runner_output.kv_connector_output
+         ec_connector_output = model_runner_output.ec_connector_output
+@@ -1946,6 +1947,7 @@
+             new_sampling_mask = None
+             new_token_ids = generated_token_ids
+             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
++            taiji_scores = taiji_scores_by_request.get(req_id)
+             kv_transfer_params = None
+             ec_transfer_params = None
+             prefill_stats = None
+@@ -1953,7 +1955,11 @@
+             num_output_tokens_before = len(request._output_token_ids)
+ 
+             # Check for stop and update request status.
+-            if new_token_ids:
++            if taiji_scores is not None:
++                new_token_ids = []
++                request.status = RequestStatus.FINISHED_STOPPED
++                stopped = True
++            elif new_token_ids:
+                 new_token_ids, stopped = self._update_request_with_output(
+                     request, new_token_ids, is_stale=output_is_stale
+                 )
+@@ -2096,6 +2102,7 @@
+                         new_sampling_mask=new_sampling_mask,
+                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                         pooling_output=pooler_output,
++                        taiji_scores=taiji_scores,
+                         stop_reason=request.stop_reason,
+                         events=request.take_events(),
+                         prefill_stats=prefill_stats,
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -232,6 +232,8 @@
+     # Per-request spec-decode acceptance; attached only on the final output.
+     # Appended last so `array_like` positional serialization stays compatible.
+     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
++
++    taiji_scores: list[float] | None = None
+ 
+     @property
+     def finished(self) -> bool:
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -288,6 +288,7 @@
+         stop_reason: int | str | None,
+         kv_transfer_params: dict[str, Any] | None = None,
+         ec_transfer_params: dict[str, Any] | None = None,
++        taiji_scores: list[float] | None = None,
+     ) -> RequestOutput | PoolingRequestOutput | None:
+         finished = finish_reason is not None
+         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
+@@ -321,6 +322,25 @@
+ 
+         external_req_id = self.external_req_id
+ 
++        if taiji_scores is not None:
++            return RequestOutput(
++                request_id=external_req_id,
++                prompt=self.prompt,
++                prompt_token_ids=self.prompt_token_ids,
++                prompt_logprobs=None,
++                outputs=[CompletionOutput(
++                    index=self.request_index,
++                    text="",
++                    token_ids=[],
++                    cumulative_logprob=None,
++                    logprobs=None,
++                    finish_reason="stop" if finished else None,
++                )],
++                finished=finished,
++                num_cached_tokens=self.num_cached_tokens,
++                taiji_scores=taiji_scores,
++            )
++
+         if pooling_output is not None:
+             return self._new_request_output(
+                 external_req_id,
+@@ -711,6 +731,7 @@
+                 stop_reason,
+                 kv_transfer_params,
+                 ec_transfer_params,
++                taiji_scores=engine_core_output.taiji_scores,
+             ):
+                 if req_state.streaming_input:
+                     request_output.finished = False
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -383,6 +383,8 @@
+ 
+     # ``None`` when ``return_sampling_mask`` is off.
+     sampling_masks: SamplingMaskLists | None = None
++
++    taiji_scores: dict[str, list[float]] | None = None
+ 
+     @staticmethod
+     def with_kv_conn_output_only(
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -171,6 +171,8 @@
+ 
+ 
+ class GPUModelRunner(LoRAModelRunnerMixin):
++    TAIJI_READOUT_PATCH_VERSION = 1
++
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+@@ -681,6 +683,17 @@
+         else:
+             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+ 
++        from vllm.model_executor.layers.taiji_readout import TaijiReadout
++
++        self.taiji_readout = TaijiReadout.load(self.model_config.model, self.device)
++        if self.taiji_readout is not None:
++            if self.speculative_config is not None:
++                raise ValueError(
++                    "Taiji readout requires speculative decoding to be disabled"
++                )
++            if self.parallel_config.pipeline_parallel_size != 1:
++                raise ValueError("Taiji readout currently requires PP=1")
++
+     def _init_kv_zero_meta(self) -> None:
+         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+         self.kv_block_zeroer = KVBlockZeroer(
+@@ -965,6 +978,8 @@
+         return cuda_graph_size
+ 
+     def _remove_request(self, req_id: str) -> bool:
++        if getattr(self, "taiji_readout", None) is not None:
++            self.taiji_readout.remove(req_id)
+         # Call model_state.remove_request *before* req_states.remove_request
+         # so the model_state can still look up the slot index.
+         self.model_state.remove_request(req_id)
+@@ -1028,6 +1043,23 @@
+                 num_computed_tokens=new_req_data.num_computed_tokens,
+                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+             )
++            if sampling_params is not None:
++                from vllm.model_executor.layers.taiji_readout import (
++                    TAIJI_READOUT_KEY,
++                    validate_spec,
++                )
++
++                readout = (sampling_params.extra_args or {}).get(TAIJI_READOUT_KEY)
++                if readout is not None:
++                    if getattr(self, "taiji_readout", None) is None:
++                        raise ValueError(
++                            "a taiji_readout request needs the worker readout, but "
++                            "the model folder has no taiji_config.json"
++                        )
++                    if sampling_params.n != 1:
++                        raise ValueError("taiji_readout requires n=1")
++                    validate_spec(readout, None, prompt_len)
++                    self.taiji_readout.register(req_id, readout)
+             req_index = self.req_states.req_id_to_index[req_id]
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.add_request(req_index)
+@@ -1857,6 +1889,10 @@
+         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+             self.pcp_manager, hidden_states, input_batch
+         )
++
++        taiji_scores: dict[str, list[float]] = {}
++        if getattr(self, "taiji_readout", None) is not None:
++            taiji_scores, _ = self.taiji_readout.collect_v2(hidden_states, input_batch)
+ 
+         sampler_output, num_sampled, num_rejected = self.sample(
+             hidden_states, input_batch, grammar_output
+@@ -1890,6 +1926,8 @@
+             sampled_token_ids=None,  # type: ignore
+             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+         )
++        if taiji_scores:
++            model_runner_output.taiji_scores = taiji_scores
+         # Start async output copy here so that it can overlap with speculator proposal.
+         async_output = AsyncOutput(
+             model_runner_output=model_runner_output,
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -502,6 +502,8 @@
+ class GPUModelRunner(
+     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+ ):
++    TAIJI_READOUT_PATCH_VERSION = 1
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -1189,7 +1191,9 @@
+         req_state: CachedRequestState | None,
+     ) -> None:
+         """Hook for platform runners to clean request-scoped side caches."""
+-        del req_id, req_state
++        if getattr(self, "taiji_readout", None) is not None:
++            self.taiji_readout.remove(req_id)
++        del req_state
+ 
+     def _process_encoder_cache_scheduler_output(
+         self,
+@@ -4554,6 +4558,33 @@
+                         num_scheduled_tokens,
+                         num_scheduled_tokens_np,
+                         kv_connector_output,
++                    )
++
++                self._taiji_step_scores = {}
++                self._taiji_step_req_ids = set()
++                if getattr(self, "taiji_readout", None) is not None:
++                    self._taiji_step_scores, self._taiji_step_req_ids = (
++                        self.taiji_readout.collect(
++                            hidden_states,
++                            self.input_batch,
++                            self.requests,
++                            self.query_start_loc.np,
++                            num_scheduled_tokens_np,
++                        )
++                    )
++                if len(self._taiji_step_req_ids) == self.input_batch.num_reqs:
++                    self.kv_connector_output = None
++                    self.eplb_step()
++                    if deferred_state_corrections_fn:
++                        deferred_state_corrections_fn()
++                    return ModelRunnerOutput(
++                        req_ids=self.input_batch.req_ids.copy(),
++                        req_id_to_index=self.input_batch.req_id_to_index.copy(),
++                        sampled_token_ids=[[] for _ in self.input_batch.req_ids],
++                        taiji_scores=self._taiji_step_scores,
++                        kv_connector_output=kv_connector_output,
++                        ec_connector_output=ec_connector_output,
++                        cudagraph_stats=cudagraph_stats,
+                     )
+ 
+                 sample_hidden_states = hidden_states[logits_indices]
+@@ -4654,6 +4685,12 @@
+         # Clear ephemeral state.
+         self.execute_model_state = None
+ 
++        for req_id in getattr(self, "_taiji_step_req_ids", ()):
++            req_index = self.input_batch.req_id_to_index[req_id]
++            self.discard_request_mask.np[req_index] = True
++        if getattr(self, "_taiji_step_req_ids", None):
++            self.discard_request_mask.copy_to_gpu(self.input_batch.num_reqs)
++
+         # Apply structured output bitmasks if present.
+         if grammar_output is not None:
+             apply_grammar_bitmask(
+@@ -4853,6 +4890,7 @@
+                 num_nans_in_logits=num_nans_in_logits,
+                 cudagraph_stats=cudagraph_stats,
+                 routed_experts=None,
++                taiji_scores=getattr(self, "_taiji_step_scores", None),
+             )
+ 
+         if not self.use_async_scheduling:
+@@ -5436,6 +5474,20 @@
+                         eplb_models += 1
+ 
+                 self._setup_eagle3_aux_hidden_state_outputs()
++
++                from vllm.model_executor.layers.taiji_readout import TaijiReadout
++
++                self.taiji_readout = TaijiReadout.load(
++                    self.model_config.model, self.device
++                )
++                if self.taiji_readout is not None:
++                    if self.use_async_scheduling or self.speculative_config is not None:
++                        raise ValueError(
++                            "Taiji readout requires async_scheduling=False and "
++                            "no speculative decoding"
++                        )
++                    if self.parallel_config.pipeline_parallel_size != 1:
++                        raise ValueError("Taiji readout currently requires PP=1")
+ 
+                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
+                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the

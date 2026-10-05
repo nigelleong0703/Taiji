@@ -1,4 +1,5 @@
 .venv/
+.venv-mac-inference/
 venv/
 __pycache__/
 *.jsonl
@@ -13,3 +14,9 @@ logs/
 COMMIT
 !examples/*.jsonl
 .pytest_cache/
+.s1-key
+audit/
+agent_runtime/audit/
+pi_agent/node_modules/
+pi_agent/.state/
+.claude/settings.local.json

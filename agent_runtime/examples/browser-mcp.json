@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "browser": {
+      "command": "uv",
+      "args": ["run", "--project", "agent_runtime", "--extra", "browser", "python", "agent_runtime/examples/browser_server.py"]
+    }
+  }
+}
