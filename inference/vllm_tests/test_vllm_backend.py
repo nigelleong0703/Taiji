@@ -90,7 +90,7 @@ def test_score_token_states_rejects_incomplete_vllm_output():
 
 
 def test_backend_compiles_dict_state_like_s1(fake_processor):
-    """TaijiVLLM must pass the raw state so compile_prefix fits it like s1.encode_prefix."""
+    """Serving preserves raw state; insufficient token budgets reject instead of trimming."""
     import vllm_backend
 
     s1 = pytest.importorskip("s1")
@@ -99,39 +99,102 @@ def test_backend_compiles_dict_state_like_s1(fake_processor):
              "elements": [{"id": f"e{i}", "label": f"L{i}"} for i in range(60)]}
     backend = vllm_backend.TaijiVLLM.__new__(vllm_backend.TaijiVLLM)  # skip __init__ (needs transformers)
     backend.processor, backend.max_len = fake_processor, 8192
+    with pytest.raises(ValueError, match="No state was truncated"):
+        backend.compile([question], state)
+    backend.max_len = 262144
     compiled = backend.compile([question], state)[0]
-    expected = s1.encode(fake_processor, {"state": state, "question": question}, max_len=8192,
+    expected = s1.encode(fake_processor, {"state": state, "question": question}, max_len=262144,
                          image_tokens=400, shuffle=False)
     assert compiled["input_ids"] == expected["input_ids"].tolist()
-    assert compiled["num_tokens"] <= 8192
+    assert 8192 < compiled["num_tokens"] <= 262144
 
 
-def test_backend_scores_batched_token_embed_outputs(fake_processor):
+def test_readout_spec_matches_compiled_prompt(fake_processor):
+    """The plain-JSON readout spec describes the compiled prompt exactly."""
+    import vllm_backend
+
+    question = {"type": "choice", "criteria": {"a": "A", "b": "B"}, "instructions": "pick"}
+    backend = vllm_backend.TaijiVLLM.__new__(vllm_backend.TaijiVLLM)
+    backend.processor, backend.max_len = fake_processor, 8192
+    item = backend.compile([question], "state")[0]
+    spec = vllm_backend.readout_spec(item)
+    assert spec == {"positions": item["positions"], "query_index": item["num_tokens"] - 1,
+                    "num_tokens": item["num_tokens"], "keys": item["keys"]}
+    assert spec["query_index"] == len(item["input_ids"]) - 1
+
+
+def test_backend_reads_generate_taiji_scores(fake_processor, monkeypatch):
+    """score() submits one readout generate request per prompt and reads RequestOutput.taiji_scores."""
+    import vllm_backend
     from vllm_backend import TaijiVLLM
-    from vllm_head import YesNoHead, score_at
 
     question = {"type": "choice", "criteria": {"a": "A", "b": "B"}, "instructions": "pick"}
     backend = TaijiVLLM.__new__(TaijiVLLM)
     backend.processor, backend.max_len = fake_processor, 8192
-    backend.head = YesNoHead(12).eval()
-    backend.head_meta = {"hidden_size": 12}
-    backend._pooling_params = object()
-    backend._llm = None
     item = backend.compile([question], "state")[0]
-    hidden = torch.randn(item["num_tokens"], 12)
+
+    built = []
+    monkeypatch.setattr(vllm_backend, "score_sampling_params",
+                        lambda spec_item: built.append(spec_item) or SimpleNamespace(
+                            extra_args={"taiji_readout": vllm_backend.readout_spec(spec_item)}))
 
     class FakeLLM:
-        def encode(self, prompts, pooling_params):
-            assert pooling_params is backend._pooling_params
+        def generate(self, prompts, params, use_tqdm=False):
             assert prompts[0]["prompt_token_ids"] == item["input_ids"]
-            return [SimpleNamespace(
-                prompt_token_ids=item["input_ids"],
-                outputs=SimpleNamespace(data=hidden),
-            )]
+            assert params[0].extra_args["taiji_readout"] == vllm_backend.readout_spec(item)
+            return [SimpleNamespace(taiji_scores=[0.25, -0.5], num_cached_tokens=7)]
 
     backend._llm = FakeLLM()
     keys, logits, token_count = backend.score([question], "state")[0]
-    expected = score_at(backend.head, hidden, item["positions"], item["num_tokens"] - 1)
+    assert built == [item]
     assert keys == item["keys"]
     assert token_count == item["num_tokens"]
-    assert logits == pytest.approx(expected.tolist())
+    assert logits == [0.25, -0.5]
+    assert backend._last_cached_tokens == 7
+
+
+def test_backend_rejects_missing_readout_scores(fake_processor, monkeypatch):
+    """A generate engine without the source patch must fail loudly, not invent scores."""
+    import vllm_backend
+    from vllm_backend import TaijiVLLM
+
+    question = {"type": "choice", "criteria": {"a": "A", "b": "B"}, "instructions": "pick"}
+    backend = TaijiVLLM.__new__(TaijiVLLM)
+    backend.processor, backend.max_len = fake_processor, 8192
+    monkeypatch.setattr(vllm_backend, "score_sampling_params",
+                        lambda spec_item: SimpleNamespace(extra_args=None))
+
+    class FakeLLM:
+        def generate(self, prompts, params, use_tqdm=False):
+            return [SimpleNamespace(taiji_scores=None, num_cached_tokens=0)]
+
+    backend._llm = FakeLLM()
+    with pytest.raises(RuntimeError, match="missing taiji_scores"):
+        backend.score([question], "state")
+
+
+def test_backend_sends_a_screenshot_as_multi_modal_data(fake_processor, monkeypatch):
+    """A screenshot state must reach the engine as multi-modal data, not only as placeholder tokens."""
+    import vllm_backend
+    from vllm_backend import TaijiVLLM
+
+    question = {"type": "choice", "criteria": {"a": "A", "b": "B"}, "instructions": "pick"}
+    backend = TaijiVLLM.__new__(TaijiVLLM)
+    backend.processor, backend.max_len, backend.image_tokens = fake_processor, 8192, 400
+    image = object()
+    compiled = [{"input_ids": [1, 2, 3], "positions": [1], "keys": ["a", "b"],
+                 "num_tokens": 3, "image": image}]
+    monkeypatch.setattr(backend, "compile", lambda questions, state="": compiled)
+    monkeypatch.setattr(vllm_backend, "score_sampling_params",
+                        lambda item: SimpleNamespace(extra_args={"taiji_readout": {}}))
+
+    seen = {}
+
+    class FakeLLM:
+        def generate(self, prompts, params, use_tqdm=False):
+            seen["prompt"] = prompts[0]
+            return [SimpleNamespace(taiji_scores=[0.1, 0.2], num_cached_tokens=0)]
+
+    backend._llm = FakeLLM()
+    backend.score([question], "state")
+    assert seen["prompt"]["multi_modal_data"] == {"image": image}

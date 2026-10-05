@@ -11,9 +11,13 @@ import sys
 import time
 
 import torch
-from s1 import encode, encode_prefix, encode_question, load
+from s1 import (encode, encode_agent_prefix, encode_prefix, encode_question, load,
+                prepend_context)
 
-base, adapter, image = sys.argv[1], sys.argv[2], sys.argv[3]
+if len(sys.argv) not in (3, 4):
+    raise SystemExit("usage: python inference/check_cache.py <base> <adapter> [screenshot.png]")
+base, adapter = sys.argv[1], sys.argv[2]
+image = sys.argv[3] if len(sys.argv) == 4 else None
 processor, model = load(base, adapter)
 model.eval()
 questions = {
@@ -25,11 +29,19 @@ questions = {
 
 
 def timed(fn):
-    torch.cuda.synchronize()
+    sync()
     started = time.perf_counter()
     result = fn()
-    torch.cuda.synchronize()
+    sync()
     return result, (time.perf_counter() - started) * 1000
+
+
+def sync():
+    device = model.head.scalar.weight.device
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def check(state):
@@ -50,10 +62,35 @@ def check(state):
     return worst if same else 1.0
 
 
+def check_agent_prefix():
+    state = {"goal": "Find flights", "recent_steps": [
+        {"step": 1, "tool": "browser__open", "status": "ok", "result": "Opened flight search"},
+        {"step": 2, "tool": "browser__observe", "status": "ok", "result": "Search form is visible"},
+    ]}
+    suffixes = [encode_question(processor.tokenizer, q)[:2] for q in questions.values()]
+    longest = max(len(suffix) for suffix, _ in suffixes)
+    prefix, tail = encode_agent_prefix(processor, state, 8192 - longest)
+    with torch.inference_mode():
+        full, t_full = timed(lambda: [model(encode(processor, {"state": state, "question": q}))
+                                      for q in questions.values()])
+        cached, t_cached = timed(lambda: model.score_questions(
+            None, prepend_context(suffixes, tail), model.prefix_cache(prefix)))
+    probs = [[torch.softmax(x.float() / model.temperature, -1) for x in pair]
+             for pair in zip(full, cached)]
+    worst = max((f - c).abs().max().item() for f, c in probs)
+    same = all(f.argmax() == c.argmax() for f, c in probs)
+    print(f"agent state: max probability diff {worst:.4f}, same top choice {same}; "
+          f"full {t_full:.0f} ms, stable-prefix cache {t_cached:.0f} ms")
+    return worst if same else 1.0
+
+
 # About the size of a real results page (Google Flights: ~6000 characters of text and ~150 controls).
 page = {"page": {"url": "https://a.test/", "title": "Flights", "text": "Where from? Where to? Search " * 200},
         "elements": [{"id": f"e{i}", "role": "button", "label": f"Flight option {i}, 9641 Thai baht"} for i in range(150)]}
-worst = max(check({**page, "screenshot": image}), check(page))
+cases = [check(page), check_agent_prefix()]
+if image:
+    cases.append(check({**page, "screenshot": image}))
+worst = max(cases)
 # bf16 kernels round differently when the suffix runs on a cached prefix. Accept it while the top choice is the same
 # and no probability moves more than 2 points, far inside the agent's 0.25 tie margin.
 print("OK: --shared-prefix is safe" if worst < 0.02 else "Keep full recompute (do not pass --shared-prefix)")

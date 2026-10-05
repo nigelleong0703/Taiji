@@ -20,7 +20,8 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
-from s1 import STATE_TOKEN_FLOOR, answer_from, encode_prefix, encode_question, kind, load
+from s1 import (STATE_TOKEN_FLOOR, answer_from, encode_agent_prefix, encode_prefix,
+                encode_question, kind, load, prepend_context)
 
 MAX_BODY = 32 * 1024 * 1024
 PREFIX_CACHE = 8  # recent page-state caches (--shared-prefix); each is tens of MB of GPU memory
@@ -47,12 +48,37 @@ def answer(processor, model, body, args):
     budget, screenshot = args.max_len - longest, body.get("screenshot")
     questions = [(suffix, positions) for suffix, positions, _ in suffixes.values()]
     hit = False
-    if args.shared_prefix:
+    reused_prefix_tokens = 0
+    cache_session = body.get("cache_session")
+    agent_prefix = (encode_agent_prefix(processor, state, budget)
+                    if args.shared_prefix and isinstance(cache_session, str)
+                    and 0 < len(cache_session) <= 128 and screenshot is None else None)
+    if agent_prefix is not None:
+        # The runtime gives each task a private cache namespace. Keep the stable goal prefix;
+        # append recent tool history and the current question to it on every decision.
+        prefix, context_tail = agent_prefix
+        key_material = json.dumps(prefix["input_ids"].tolist(), separators=(",", ":"))
+        key = hashlib.sha256(f"agent:{cache_session}:".encode() + key_material.encode()).digest()
+        hit = key in PREFIXES
+        if hit:
+            PREFIXES.move_to_end(key)
+            encoded = time.perf_counter()
+            reused_prefix_tokens = len(prefix["input_ids"])
+        else:
+            encoded = time.perf_counter()
+            PREFIXES[key] = (*model.prefix_cache(prefix), len(prefix["input_ids"]))
+            while len(PREFIXES) > PREFIX_CACHE:
+                PREFIXES.popitem(last=False)
+        cached = PREFIXES[key][:2]
+        scores = model.score_questions(None, prepend_context(questions, context_tail), cached)
+        prefix_tokens = len(prefix["input_ids"]) + len(context_tail)
+    elif args.shared_prefix:
         # The same page state recurs (a tie-break, a re-ask on an unchanged page, a loop): reuse its prefix cache.
         key = hashlib.sha256(json.dumps([state, screenshot, budget, args.image_tokens]).encode()).digest()
         hit = key in PREFIXES
         if hit:
             PREFIXES.move_to_end(key)
+            reused_prefix_tokens = PREFIXES[key][2]
         encoded = time.perf_counter()
         if not hit:
             prefix = encode_prefix(processor, state, budget, args.image_tokens, screenshot)
@@ -66,8 +92,11 @@ def answer(processor, model, body, args):
         prefix = encode_prefix(processor, state, budget, args.image_tokens, screenshot)
         encoded, prefix_tokens = time.perf_counter(), len(prefix["input_ids"])
         scores = [model({"prefix": prefix, "suffix": suffix, "positions": positions}) for suffix, positions in questions]
-    if torch.cuda.is_available():
+    device = model.head.scalar.weight.device
+    if device.type == "cuda":
         torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
     scored = time.perf_counter()
     answers = {}
     for (name, (_, _, keys)), logits in zip(suffixes.items(), scores):
@@ -78,6 +107,7 @@ def answer(processor, model, body, args):
     # Where the time goes: CPU encoding (image resize, tokenising) vs the model, and prefix vs per-question tokens.
     timing = {"encode_ms": round((encoded - started) * 1000), "model_ms": round((scored - encoded) * 1000),
               "prefix_hit": hit, "prefix_tokens": prefix_tokens,
+              "reused_prefix_tokens": reused_prefix_tokens,
               "question_tokens": {name: len(suffix) for name, (suffix, _, _) in suffixes.items()}}
     return {"model": args.name, "answers": answers, "usage": {"input_tokens": tokens, "output_tokens": 0}, "timing": timing}
 
@@ -106,14 +136,16 @@ def chat(processor, model, body, args):
 
 def complete(processor, model, body, args):
     """The agent's field_text() sends [system prompt, user: JSON field context] and expects {"text": ...}."""
-    if body.get("model", args.name) != args.name:
+    is_vllm = getattr(args, "backend", "transformers") == "vllm"
+    if not is_vllm and body.get("model", args.name) != args.name:
         return chat(processor, model, body, args)
     user = next(m["content"] for m in reversed(body["messages"]) if m.get("role") == "user")
     try:
         context = json.loads(user)
     except json.JSONDecodeError:
         context = user
-    text = model.write(processor, context, args.max_len)
+    text = (model.write(context, args.max_len) if is_vllm
+            else model.write(processor, context, args.max_len))
     content = json.dumps({"text": text or None})  # null lets the agent escalate to its S2 model
     return {"model": args.name, "object": "chat.completion",
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
@@ -130,15 +162,23 @@ def main():
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--max-len", type=int, default=8192)
+    p.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto",
+                   help="Transformers device; auto prefers CUDA, then Apple MPS, then CPU")
     p.add_argument("--image-tokens", type=int, default=400)
     p.add_argument("--name")
     p.add_argument("--dtype", default="bfloat16", help="vLLM model dtype")
     p.add_argument("--gpu-memory-utilization", type=float)
     p.add_argument("--max-num-batched-tokens", type=int)
+    p.add_argument("--quantization", help="vLLM weight quantization scheme, e.g. fp8_per_tensor")
+    p.add_argument("--quantization-config", type=json.loads, help="vLLM online quantization configuration JSON")
+    p.add_argument("--cpu-offload-gb", type=float, default=0, help="vLLM weight offload to CPU RAM")
+    p.add_argument("--mm-max-pixels", type=int, help="maximum screenshot pixels for vLLM profiling/processing")
+    p.add_argument("--max-num-seqs", type=int, help="vLLM concurrent sequence limit")
+    p.add_argument("--enforce-eager", action="store_true", help="disable vLLM CUDA graphs")
     p.add_argument("--plain-chat", action="store_true",
                    help="keep the LoRA unmerged so other model names get the base model (slower decisions)")
     p.add_argument("--shared-prefix", action="store_true",
-                   help="reuse the page-state cache across questions; enable only if check_cache.py passes")
+                   help="reuse validated shared state prefixes; enable only if check_cache.py passes")
     args = p.parse_args()
     key = os.environ.get("S1_API_KEY")
     if not key:
@@ -159,6 +199,18 @@ def main():
             engine_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
         if args.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+        if args.max_num_seqs is not None:
+            engine_kwargs["max_num_seqs"] = args.max_num_seqs
+        if args.quantization:
+            engine_kwargs["quantization"] = args.quantization
+        if args.quantization_config is not None:
+            engine_kwargs["quantization_config"] = args.quantization_config
+        if args.cpu_offload_gb:
+            engine_kwargs["cpu_offload_gb"] = args.cpu_offload_gb
+        if args.mm_max_pixels is not None:
+            engine_kwargs["mm_processor_kwargs"] = {"max_pixels": args.mm_max_pixels}
+        if args.enforce_eager:
+            engine_kwargs["enforce_eager"] = True
         processor = None
         model = TaijiVLLM(args.model, args.head_bundle or args.model, max_len=args.max_len,
                           engine_kwargs=engine_kwargs)
@@ -167,7 +219,7 @@ def main():
         if not args.adapter:
             p.error("--backend transformers requires --adapter")
         # Merged LoRA runs no extra adapter matmuls; only plain chat needs it unmerged, to switch it off per request.
-        processor, model = load(args.base, args.adapter, merge=not args.plain_chat)
+        processor, model = load(args.base, args.adapter, merge=not args.plain_chat, device=args.device)
         model.eval()
     lock = threading.Lock()  # one GPU, one request at a time
 
@@ -181,14 +233,12 @@ def main():
             self.wfile.write(data)
 
         def do_GET(self):
-            self.send(200, {"ok": True, "model": args.name}) if self.path == "/health" else self.send(404, {})
+            self.send(200, {"ok": True, "model": args.name, "max_model_len": args.max_len, "quantization": args.quantization, "cpu_offload_gb": args.cpu_offload_gb}) if self.path == "/health" else self.send(404, {})
 
         def do_POST(self):
             routes = {"/v1/systemone": answer, "/v1/chat/completions": complete}
             if self.path not in routes:
                 return self.send(404, {"error": "not found"})
-            if args.backend == "vllm" and self.path == "/v1/chat/completions":
-                return self.send(501, {"error": "chat completions require --backend transformers"})
             if not hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {key}"):
                 return self.send(401, {"error": "unauthorized"})
             length = int(self.headers.get("Content-Length") or 0)

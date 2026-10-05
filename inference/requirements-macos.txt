@@ -1,0 +1,9 @@
+# Apple Silicon inference. Install in a native arm64 Python 3.12 environment.
+# The CUDA-specific index and flash-linear-attention kernel are intentionally omitted;
+# Qwen3.5 uses the Transformers PyTorch fallback on MPS.
+torch==2.14.0
+torchvision==0.29.0
+transformers==5.17.0
+peft==0.21.0
+safetensors==0.8.0
+pillow==12.3.0

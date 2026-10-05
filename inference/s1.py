@@ -16,6 +16,7 @@ import copy
 import io
 import json
 import math
+import os
 import random
 from pathlib import Path
 
@@ -30,6 +31,9 @@ LORA_TARGETS = (
 )
 OPTION_TOKEN_CAP = 96  # a single long option cannot starve the page state
 STATE_TOKEN_FLOOR = 1024  # options shrink before the page state gets fewer tokens than this
+# Training and serving share this ceiling: raising TAIJI_MAX_CRITERIA lets both sides see larger action
+# spaces, so an experiment never trains and serves against different option counts.
+MAX_CRITERIA = int(os.environ.get("TAIJI_MAX_CRITERIA", "255"))
 MARKER = "<|quad_end|>"  # closes every option; the decision head reads its hidden state
 HEADERS = {
     "choice": "Choose exactly one option.",
@@ -62,13 +66,14 @@ def plain(tokenizer, text):
 def as_options(question):
     """Jev question -> {option key: criterion}. noul: true/false; score: levels "0".."n-1"."""
     kind, criteria = question.get("type", "choice"), question.get("criteria")
-    if kind == "choice" and isinstance(criteria, dict) and 1 <= len(criteria) <= 255:
+    if kind == "choice" and isinstance(criteria, dict) and 1 <= len(criteria) <= MAX_CRITERIA:
         return criteria
     if kind == "noul" and isinstance(criteria, dict) and set(criteria) == {"true", "false"}:
         return {"true": criteria["true"], "false": criteria["false"]}
     if kind == "score" and isinstance(criteria, list) and 2 <= len(criteria) <= 10:
         return {str(i): level for i, level in enumerate(criteria)}
-    raise ValueError("choice needs 1-255 criteria, noul needs criteria true/false, score needs 2-10 levels")
+    raise ValueError(
+        f"choice needs 1-{MAX_CRITERIA} criteria, noul needs criteria true/false, score needs 2-10 levels")
 
 
 def encode_question(tokenizer, question, shuffle=False, max_tokens=None):
@@ -148,6 +153,47 @@ def encode_prefix(processor, state, max_tokens, image_tokens=400, screenshot=Non
         token_types[: head["mm_token_type_ids"].shape[1]] = head["mm_token_type_ids"][0]
     return {"input_ids": input_ids, "mm_token_type_ids": token_types,
             "pixel_values": head.get("pixel_values"), "image_grid_thw": head.get("image_grid_thw")}
+
+
+def encode_agent_prefix(processor, state, max_tokens):
+    """Split the agent's trained-format state into an immutable goal prefix and changing history tail.
+
+    Concatenating `prefix.input_ids` and `tail` exactly reproduces `encode_prefix` for the same state.
+    This lets a serving cache retain the goal computation across agent turns while the recent tool history
+    and decision suffix are still evaluated for each new state. Other state shapes should use encode_prefix.
+    """
+    if (not isinstance(state, dict) or set(state) != {"goal", "recent_steps"}
+            or not isinstance(state["goal"], str) or not isinstance(state["recent_steps"], list)):
+        return None
+
+    tokenizer = processor.tokenizer
+    head = processor(text=["State: "], images=None, return_tensors="pt")
+    budget = max_tokens - head["input_ids"].shape[1] - 8
+    if budget < 64:
+        raise ValueError("Too many or too long options for max_len")
+
+    state_ids = fit_state(tokenizer, state, budget)
+    stable_text = as_text({"goal": state["goal"], "recent_steps": []})[:-2]  # leave the list open
+    stable_ids = plain(tokenizer, stable_text)
+    common = 0
+    while common < min(len(stable_ids), len(state_ids)) and stable_ids[common] == state_ids[common]:
+        common += 1
+
+    base_ids = torch.cat([head["input_ids"][0], torch.tensor(state_ids[:common], dtype=torch.long)])
+    token_types = torch.zeros_like(base_ids)
+    if head.get("mm_token_type_ids") is not None:
+        token_types[: head["mm_token_type_ids"].shape[1]] = head["mm_token_type_ids"][0]
+    prefix = {"input_ids": base_ids, "mm_token_type_ids": token_types,
+              "pixel_values": None, "image_grid_thw": None}
+    tail = torch.tensor(state_ids[common:], dtype=torch.long)
+    return prefix, tail
+
+
+def prepend_context(questions, context):
+    """Append changing state tokens before each decision suffix and shift option readout positions."""
+    if not len(context):
+        return questions
+    return [(torch.cat([context, suffix]), positions + len(context)) for suffix, positions in questions]
 
 
 def encode(processor, row, max_len=8192, image_tokens=400, shuffle=False):
@@ -386,11 +432,43 @@ class S1(torch.nn.Module):
         return processor.tokenizer.decode(out[0, ids.shape[1] :], skip_special_tokens=True).strip()
 
 
-def load(base, adapter=None, merge=True, device="cuda"):
+def resolve_device(device="auto"):
+    """Select an explicit accelerator, preferring CUDA then Apple MPS for local inference."""
+    if device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    selected = torch.device(device)
+    if selected.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    if selected.type == "mps" and (not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available()):
+        raise RuntimeError("MPS was requested but is not available; use an Apple Silicon Mac and an MPS-enabled PyTorch")
+    return selected
+
+
+def load(base, adapter=None, merge=True, device="auto", dtype=None):
     """Processor + model; with `adapter` (a LoRA or a --full run's folder), the trained head and fitted temperature."""
+    device = resolve_device(device)
+    if dtype is None:
+        dtype = (torch.bfloat16 if device.type == "cuda" else
+                 torch.float16 if device.type == "mps" else torch.float32)
     processor = AutoProcessor.from_pretrained(base)
     full = adapter and not (Path(adapter) / "adapter_config.json").exists()
-    lm = Qwen3_5ForConditionalGeneration.from_pretrained(adapter if full else base, dtype=torch.bfloat16)
+    # flash-attn is CUDA-only and is never auto-selected: without this argument the model silently
+    # runs the slower attention path even when the package is installed.
+    # TAIJI_ATTN=sdpa forces the generic path, which is how the flash-attn contribution is measured.
+    attention = os.environ.get("TAIJI_ATTN") or None
+    if attention is None and device.type == "cuda":
+        try:
+            import flash_attn  # noqa: F401
+            attention = "flash_attention_2"
+        except ImportError:
+            attention = None
+    lm = Qwen3_5ForConditionalGeneration.from_pretrained(
+        adapter if full else base, dtype=dtype,
+        **({"attn_implementation": attention} if attention else {}))
     if adapter and not full:
         from peft import PeftModel
 
