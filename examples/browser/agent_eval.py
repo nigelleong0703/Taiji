@@ -88,7 +88,7 @@ def flights_ok(p):
 def run(name, url, goal, check):
     started, agent, error = time.time(), None, None
     try:
-        with Agent(url, goal) as agent:
+        with Agent(url, goal, verifier=check) as agent:
             for _ in agent.run():
                 pass
     except Exception as e:  # noqa: BLE001 - a failed run is a result, not a crash of the evaluation
@@ -101,12 +101,14 @@ def run(name, url, goal, check):
     decisions = (state or {}).get("decisions") or []
     latencies = [d["latency_ms"] for d in decisions if d.get("latency_ms")]
     status = (state or {}).get("status")
-    success = bool(page["url"]) and check(page)
+    verification = (state or {}).get("verification") or {}
+    success = verification.get("passed") is True
     return {"task": name, "status": status, "success": success, "false_done": status == "done" and not success,
             "actions": len((state or {}).get("history") or []), "decisions": len(decisions),
             "elapsed_s": round(time.time() - started, 1),
             "decision_ms_median": round(statistics.median(latencies)) if latencies else None,
             "final_url": page["url"][:200], "final_text": page["text"][:1500],
+            "verification": verification,
             "blocked_reason": (state or {}).get("blocked_reason"), "error": error,
             "operations": [d.get("operation") for d in decisions],
             # Per decision: p(DONE), input tokens and time, to see whether DONE was close and where the time goes.

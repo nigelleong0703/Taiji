@@ -11,6 +11,8 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = ["browser-harness==0.1.13; python_version >= '3.11'", "httpx[http2]>=0.28,<1"]
+desktop = ["cua-driver>=0.33,<0.34; sys_platform == 'darwin'"]
+sandbox = ["e2b-desktop>=2.4,<3"]
 
 [project.scripts]
 taiji-agent = "taiji_agent.cli:main"

@@ -45,14 +45,13 @@ def main():
     args = parser.parse_args()
     folder = Path(args.output)
     folder.mkdir(parents=True, exist_ok=True)
-    agent = Agent(URL, GOALS)
+    agent = Agent(URL, GOALS, verifier=verify)
     try:
         for state in agent.run():
             last = state["history"][-1] if state["history"] else {}
             print(state["elapsed_ms"], state["status"], last.get("action", ""), flush=True)
     finally:
         state = agent.snapshot()
-        state["verification"] = verify(state["page"])
         (folder / "state.json").write_text(json.dumps(state, indent=2))
         (folder / "session.json").write_text(
             json.dumps({"target": agent.browser.target, "session": agent.browser.session})

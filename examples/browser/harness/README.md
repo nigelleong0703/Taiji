@@ -48,7 +48,7 @@ page → element table → operation                 │
 
 Target questions are speculative. If the operation is `CLICK`, only `click_target` can execute. Two decisions, **one network round trip**. Each target head contains only compatible elements. Native dropdown choices carry an observed element/option index.
 
-There are no site-specific action scripts or prepared field strings in the policy. The Flights example supplies a goal and independently verifies the outcome. The screenshot renderer adds labels afterward; it does not drive the browser.
+There are no site-specific action scripts or prepared field strings in the policy. The Flights example supplies a goal and an independent verifier. If a verifier is configured, `DONE` ends the run only when that check passes; a failed check is sent to System 2 for a corrective subgoal. Without a verifier, the run ends with `verification.passed = null`, so callers can distinguish a model claim from checked success. The screenshot renderer adds labels afterward; it does not drive the browser.
 
 ## Try it
 
@@ -70,12 +70,14 @@ Chrome connects through [Browser Harness](https://github.com/browser-use/browser
 ## Use the library
 
 ```python
+from examples.flights import verify as verify_flights
 from jev_ultrafast import Agent
 
 with Agent(
     "https://www.google.com/travel/flights?hl=en",
     "Find one-way flights from Zurich to London on September 20, 2026, "
     "for one adult in economy. Stop when matching flight options are visible.",
+    verifier=verify_flights,
 ) as agent:
     for state in agent.run():
         print(state["elapsed_ms"], state["status"])
@@ -102,7 +104,7 @@ uv run --env-file .env python examples/run.py \
 - **Send visible text.** Offscreen article bodies and footers do not fill the model context.
 - **Reuse an interrupted text request.** A generated value survives a stale-page retry only if the entire text-helper input is unchanged.
 
-Every executed target is resolved from an observed node. The executor rechecks page freshness and click occlusion: click, select and fill decisions compare the target and its nearby context plus document/form state; DONE and BLOCKED compare the document, URL, scroll and form state. After three decisions in a row are voided by page changes, the loop waits briefly for the page to settle; after eight, System 2 takes the page. System 2 answers with a subgoal for the fast policy, a stop reason when the goal is infeasible, or done when the page already satisfies the goal (like a DONE choice, a claim to verify). Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing.
+Every executed target is resolved from an observed node. The executor rechecks page freshness and click occlusion: click, select and fill decisions compare the target and its nearby context plus document/form state; DONE and BLOCKED compare the document, URL, scroll and form state. After three decisions in a row are voided by page changes, the loop waits briefly for the page to settle; after eight, System 2 takes the page. System 2 answers with a subgoal for the fast policy, a stop reason when the goal is infeasible, or done when the page already satisfies the goal. When an independent verifier is configured, its failed result prevents either model from ending the run as successful. Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing.
 
 ## Small enough to read
 

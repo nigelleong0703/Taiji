@@ -14,12 +14,13 @@ STALE_SETTLE, STALE_ESCALATE = 3, 8
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, verifier=None):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
+        self.verifier = verifier
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir) or bool(os.environ.get("TYPESAFE_SCREENSHOT"))
@@ -40,6 +41,7 @@ class Agent:
             decisions=[],
             text_calls=[],
             reflections=[],
+            verification=None,
             subgoal=None,
             blocked_reason=None,
             reflected_at=0,
@@ -121,8 +123,14 @@ class Agent:
                 elif selected == "BLOCKED":
                     self.escalate("The fast policy chose BLOCKED.")
                 else:
-                    state["status"] = "done"
-                    state["plan_index"] = 1
+                    self.finish_or_replan(page)
+                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                return self.snapshot()
+            if selected == "LOOK":
+                # The model asked to see the page: capture it, and the next decision carries the picture.
+                os.environ["TYPESAFE_SCREENSHOT"] = "1"
+                state["page"] = state["browser"].observe(screenshot=True)
+                state["status"] = "ready"
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
@@ -191,7 +199,28 @@ class Agent:
             raise ValueError("Unknown command")
         return self.snapshot()
 
-    def escalate(self, trigger):
+    def finish_or_replan(self, page):
+        """A model may propose DONE, but an optional independent verifier decides whether the run ends."""
+        state = self.state
+        if self.verifier is None:
+            state["verification"] = {"passed": None, "reason": "No independent verifier configured."}
+            state["status"], state["plan_index"] = "done", 1
+            return
+        try:
+            result = self.verifier(page)
+            passed = result is True or (isinstance(result, dict) and result.get("passed") is True)
+            evidence = result if isinstance(result, dict) else {"passed": passed}
+        except Exception as error:  # verifier failure cannot turn a model claim into success
+            passed, evidence = False, {"passed": False, "reason": f"Verifier error: {type(error).__name__}: {error}"}
+        state["verification"] = evidence
+        if passed:
+            state["status"], state["plan_index"] = "done", 1
+            return
+        state["status"] = "ready"
+        self.escalate("The independent completion verifier did not confirm the goal. "
+                      f"Evidence: {evidence}", allow_done=False)
+
+    def escalate(self, trigger, *, allow_done=True):
         """System 1 is stuck: ask System 2 for a language subgoal, or stop: finished, or infeasible with its reason."""
         state = self.state
         state.setdefault("reflections", [])
@@ -201,7 +230,8 @@ class Agent:
         # A System 2 call changes nothing in the browser, so one retry of a malformed or failed answer is safe.
         for attempt in (1, 2):
             try:
-                verdict, text, meta = reflect(state["goal"], state["page"], state["history"], trigger)
+                verdict, text, meta = reflect(state["goal"], state["page"], state["history"], trigger,
+                                              allow_done=allow_done)
                 break
             except (ValueError, RuntimeError) as error:
                 if attempt == 2:
@@ -212,8 +242,11 @@ class Agent:
         state["reflected_at"] = len(state["history"])
         if verdict == "infeasible":
             state["status"], state["blocked_reason"] = "blocked", text
-        elif verdict == "done":  # like a DONE choice: claimed, not proven; callers verify the outcome
+        elif verdict == "done" and allow_done:  # a System 2 claim is still checked by the caller's verifier
             state["status"], state["plan_index"] = "done", 1
+        elif verdict == "done":
+            state["status"] = "blocked"
+            state["blocked_reason"] = "System 2 said done after independent verification failed."
         else:
             state["subgoal"], state["status"] = text, "ready"
 

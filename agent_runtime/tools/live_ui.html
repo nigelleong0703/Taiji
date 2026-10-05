@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Taiji 实时 Agent</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef; --dim:#8b93a7;
+          --ok:#3ecf8e; --warn:#e5a54a; --err:#f2686f; --s1:#6aa9ff; --s2:#c98bff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:10px 14px; border-bottom:1px solid var(--line); display:flex; gap:10px;
+           align-items:center; flex-wrap:wrap; }
+  h1 { font-size:14px; margin:0 12px 0 0; font-weight:600; }
+  input, textarea, button { font:inherit; color:var(--fg); background:#0b0d11;
+    border:1px solid var(--line); border-radius:5px; padding:6px 9px; }
+  textarea { width:100%; resize:vertical; }
+  button { cursor:pointer; background:#1d2430; }
+  button.primary { background:#2a6df4; border-color:#2a6df4; color:#fff; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  main { display:grid; grid-template-columns:1fr 460px; gap:0; height:calc(100vh - 47px); }
+  #left { display:flex; flex-direction:column; border-right:1px solid var(--line); min-width:0; }
+  #browser { background:#000; flex:1; display:flex; align-items:center; justify-content:center; }
+  #browser img { max-width:100%; max-height:100%; object-fit:contain; }
+  #right { display:flex; flex-direction:column; min-width:0; }
+  #log { flex:1; overflow-y:auto; padding:8px 10px; }
+  .ev { border-left:2px solid var(--line); padding:5px 8px; margin-bottom:6px; background:var(--panel); }
+  .ev.s1_decision { border-color:var(--s1); }
+  .ev.s2_request, .ev.s2_reflection { border-color:var(--s2); }
+  .ev.mcp_tool { border-color:var(--ok); }
+  .ev.error, .ev.run_error, .ev.browser_error { border-color:var(--err); }
+  .k { color:var(--dim); }
+  .tag { display:inline-block; padding:0 5px; border-radius:3px; background:#0b0d11;
+         border:1px solid var(--line); margin-right:6px; font-size:11px; }
+  .s1_decision .tag { border-color:var(--s1); color:var(--s1); }
+  .s2_request .tag, .s2_reflection .tag { border-color:var(--s2); color:var(--s2); }
+  .bar { height:4px; background:#0b0d11; border-radius:2px; overflow:hidden; margin-top:4px; }
+  .bar > i { display:block; height:100%; background:var(--s1); }
+  details { margin-top:4px; }
+  summary { cursor:pointer; color:var(--dim); }
+  pre { white-space:pre-wrap; word-break:break-word; background:#0b0d11; padding:6px;
+        border-radius:4px; max-height:230px; overflow:auto; margin:4px 0 0; font-size:11px; }
+  #result { padding:10px 14px; border-top:1px solid var(--line); background:var(--panel); }
+  #panel { padding:10px 14px; border-top:1px solid var(--line); }
+  .row { display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap; }
+  .grow { flex:1; min-width:120px; }
+  .pill { padding:1px 7px; border-radius:9px; border:1px solid var(--line); color:var(--dim); }
+  #status.running { color:var(--warn); border-color:var(--warn); }
+  #status.done { color:var(--ok); border-color:var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Taiji 实时 Agent</h1>
+  <input id="url" class="grow" placeholder="起始 URL" value="__DEFAULT_URL__">
+  <label class="k">步数 <input id="steps" type="number" min="0" max="200" value="__DEFAULT_STEPS__" style="width:64px" title="0 = 不设上限，跑到模型判定完成或停滞保护触发"></label>
+  <label class="k" title="勾选则重新连接并开始新对话；不勾选则接着上一轮继续"><input id="fresh" type="checkbox"> 新会话</label>
+  <button id="start" class="primary">开始</button>
+  <span id="status" class="pill">idle</span>
+</header>
+<main>
+  <div id="left">
+    <div id="panel">
+      <div class="row">
+        <textarea id="goal" rows="2" placeholder="任务 prompt">__DEFAULT_PROMPT__</textarea>
+      </div>
+    </div>
+    <div id="browser"><img id="shot" alt="browser"></div>
+  </div>
+  <div id="right">
+    <div id="log"></div>
+    <div id="result"><span class="k">结果会显示在这里。</span></div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let seen = 0;
+
+function fmt(ev) {
+  const t = ev.event || "";
+  const at = `<span class="k">${ev.at_ms ?? 0}ms</span>`;
+  const dur = ev.duration_ms ? `<span class="k"> · ${ev.duration_ms}ms</span>` : "";
+  if (t === "s1_decision") {
+    const p = ev.confidence ?? 0;
+    const bar = `<div class="bar"><i style="width:${(p*100).toFixed(0)}%"></i></div>`;
+    const probs = ev.probabilities
+      ? `<details><summary>动作概率</summary><pre>${JSON.stringify(ev.probabilities,null,1)}</pre></details>` : "";
+    const req = ev.request
+      ? `<details><summary>发给 S1 的完整请求</summary><pre>${JSON.stringify(ev.request,null,1)}</pre></details>` : "";
+    return `<span class="tag">S1</span>选 <b>${ev.choice}</b> ${ev.operation||""} ` +
+           `p=${p.toFixed(3)}${at}${dur}${bar}${probs}${req}`;
+  }
+  if (t === "mcp_tool")
+    return `<span class="tag">${ev.source||"?"}</span>${ev.tool} → ${ev.status} (${ev.duration_ms}ms)${at}`;
+  if (t === "s2_request")
+    return `<span class="tag">S2</span>${ev.tool || "final answer"} ${at}${dur}` +
+           (ev.text ? `<details><summary>内容</summary><pre>${ev.text}</pre></details>` : "");
+  if (t === "s2_reflection")
+    return `<span class="tag">S2</span>反思 <b>${ev.verdict}</b> (${ev.trigger||""}) ${at}` +
+           `<details><summary>内容</summary><pre>${ev.text||""}</pre></details>`;
+  if (t === "s1_field_text")
+    return `<span class="tag">S1</span>写字段 <b>${ev.field||""}</b> → ${ev.status}` +
+           (ev.text ? ` "${ev.text}"` : "") + `${at}${dur}`;
+  if (t === "run_finished") return `<span class="tag">END</span>status=${ev.status} steps=${ev.steps}`;
+  if (t === "browser_error" || t === "run_error")
+    return `<span class="tag">ERR</span>${ev.error}`;
+  if (t === "browser_open") return `<span class="tag">PAGE</span>${ev.url}`;
+  return `<span class="tag">${t}</span>${at}`;
+}
+
+function append(evs) {
+  const log = $("log");
+  for (const ev of evs) {
+    const div = document.createElement("div");
+    div.className = "ev " + (ev.event || "") + (ev.status === "error" ? " error" : "");
+    div.innerHTML = fmt(ev);
+    log.appendChild(div);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+async function refreshFrame() {
+  try {
+    const r = await fetch("/frame.jpg", { cache: "no-store" });
+    if (r.ok && r.headers.get("Content-Length") !== "0") {
+      $("shot").src = URL.createObjectURL(await r.blob());
+    }
+  } catch (e) {}
+}
+
+function listen() {
+  const es = new EventSource("/events");
+  es.onmessage = (m) => {
+    const d = JSON.parse(m.data);
+    if (d.events && d.events.length) append(d.events);
+    if (d.frame) refreshFrame();
+    if (d.result) {
+      const r = d.result;
+      $("result").innerHTML = `<b>${r.status}</b> · 第 ${r.turn ?? 1} 轮 · ${r.elapsed_ms ?? 0}ms · ` +
+        `${(r.steps||[]).length} 步` + (r.audit ? ` · audit: ${r.audit}` : "") +
+        `<pre>${r.message||""}</pre>`;
+      $("status").textContent = r.status;
+      $("status").className = "pill done";
+      $("start").disabled = false;
+      es.close();
+    }
+  };
+  es.onerror = () => { $("status").textContent = "disconnected"; };
+}
+
+$("start").onclick = async () => {
+  $("log").innerHTML = "";
+  $("result").innerHTML = "";
+  $("status").textContent = "running";
+  $("status").className = "pill running";
+  $("start").disabled = true;
+  // The stream is already open from page load; opening a second one would render every event twice.
+  refreshFrame();
+  await fetch("/start", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({
+    goal: $("goal").value, url: $("url").value,
+    max_steps: Number($("steps").value),
+    fresh: $("fresh").checked }) });
+};
+listen();
+setInterval(refreshFrame, 1200);
+</script>
+</body>
+</html>

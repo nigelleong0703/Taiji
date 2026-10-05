@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "desktop": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "agent_runtime",
+        "python",
+        "agent_runtime/examples/cua_desktop_server.py"
+      ]
+    }
+  }
+}

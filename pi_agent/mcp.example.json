@@ -1,0 +1,51 @@
+{
+  "autoEnableCodemode": false,
+  "mcpServers": {
+    "browser": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "agent_runtime",
+        "python",
+        "agent_runtime/examples/pilot_browser_server.py"
+      ],
+      "exposure": "direct",
+      "toolExposure": {
+        "screenshot": "hidden",
+        "close": "hidden",
+        "open": "hidden"
+      },
+      "description": "Pilot browser observation, element actions, navigation and optional images."
+    },
+    "desktop": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "agent_runtime",
+        "python",
+        "agent_runtime/examples/cua_desktop_server.py"
+      ],
+      "exposure": "direct",
+      "description": "macOS desktop windows via cua-driver: accessibility-tree observation, element actions, app focus and optional images."
+    },
+    "sandbox": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "agent_runtime",
+        "--extra",
+        "sandbox",
+        "python",
+        "agent_runtime/examples/sandbox_desktop_server.py"
+      ],
+      "exposure": "direct",
+      "toolExposure": {
+        "sandbox_info": "hidden"
+      },
+      "description": "A Linux desktop (Debian/XFCE: Chromium, LibreOffice Writer/Calc/Impress, Mousepad, terminal) in a fresh E2B sandbox VM: accessibility-tree observation, element actions, app launch, URL navigation and optional images. Nothing runs on the user's machine."
+    }
+  }
+}

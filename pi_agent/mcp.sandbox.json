@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "sandbox": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "agent_runtime",
+        "--extra",
+        "sandbox",
+        "python",
+        "agent_runtime/examples/sandbox_desktop_server.py"
+      ],
+      "exposure": "direct",
+      "toolExposure": {
+        "sandbox_info": "hidden"
+      },
+      "description": "A Linux desktop (Debian/XFCE: Chromium, LibreOffice Writer/Calc/Impress, Mousepad, terminal) in a fresh E2B sandbox VM: accessibility-tree observation, element actions, app launch, URL navigation and optional images. Nothing runs on the user's machine."
+    }
+  }
+}

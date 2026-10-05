@@ -82,6 +82,13 @@
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    // Where a link goes is a fact about the element, and it is the only thing that tells a navigation
+    // tab pointing at the current page apart from a link to somewhere new. Truncated: the path is what
+    // matters, not a long query string.
+    if (rname==='link') {
+      const href=(e.getAttribute('href')||'').trim();
+      if (href && !href.startsWith('javascript:')) base.href=href.slice(0,80);
+    }
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
@@ -124,6 +131,8 @@
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
+  // The model decides when it needs the pixels; the harness only makes the choice available.
+  actions.push({id:'look',kind:'look',label:'Look at the screen (screenshot of the current view)'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
 })()

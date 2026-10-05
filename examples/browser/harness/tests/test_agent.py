@@ -174,7 +174,9 @@ def runner():
         "started_at": time.perf_counter(),
         "record": False,
         "text_calls": [],
+        "verification": None,
     }
+    a.verifier = None
     return a
 
 
@@ -351,6 +353,12 @@ def test_system2_rejects_anything_but_a_verdict(monkeypatch, content):
         model.reflect("Find a book", page(), [], "stuck")
 
 
+def test_system2_done_is_invalid_after_verifier_failure(monkeypatch):
+    monkeypatch.setattr(model, "text_model", Mock(return_value=('{"verdict":"done","text":"Looks complete"}', {})))
+    with pytest.raises(ValueError, match="no valid verdict"):
+        model.reflect("Find a book", page(), [], "verification failed", allow_done=False)
+
+
 def test_navigation_during_prediction_reobserves_without_action(runner):
     runner.state["browser"].fresh.side_effect = StalePage("Document navigating")
     runner.command("tick")
@@ -432,6 +440,39 @@ def test_done_checks_only_the_page_identity_not_live_content(runner):
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     runner.state["browser"].fresh.assert_called_with(runner.state["page"], page_only=True)
     assert runner.state["status"] == "done"
+
+
+def test_done_with_failed_independent_check_replans(runner, monkeypatch):
+    runner.verifier = Mock(return_value={"passed": False, "checks": {"results_visible": False}})
+    s2 = Mock(return_value=("subgoal", "Submit the populated search form", {"latency_ms": 1}))
+    monkeypatch.setattr(loop, "reflect", s2)
+    runner.state["decision"] = {**decision("DONE"), "operation": "DONE", "target": None}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    assert runner.state["subgoal"] == "Submit the populated search form"
+    assert runner.state["verification"]["checks"]["results_visible"] is False
+    assert s2.call_args.kwargs["allow_done"] is False
+
+
+def test_done_with_passed_independent_check_finishes(runner, monkeypatch):
+    runner.verifier = Mock(return_value={"passed": True, "checks": {"results_visible": True}})
+    s2 = Mock()
+    monkeypatch.setattr(loop, "reflect", s2)
+    runner.state["decision"] = {**decision("DONE"), "operation": "DONE", "target": None}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert runner.state["verification"]["passed"] is True
+    s2.assert_not_called()
+
+
+def test_failed_independent_check_cannot_be_overridden_by_system2_done(runner, monkeypatch):
+    runner.verifier = Mock(return_value=False)
+    monkeypatch.setattr(loop, "reflect", Mock(return_value=("done", "It looks complete", {"latency_ms": 1})))
+    runner.state["decision"] = {**decision("DONE"), "operation": "DONE", "target": None}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["verification"]["passed"] is False
+    assert "verification failed" in runner.state["blocked_reason"]
 
 
 def test_fill_checks_the_field_and_its_context_before_text_generation(runner, monkeypatch):

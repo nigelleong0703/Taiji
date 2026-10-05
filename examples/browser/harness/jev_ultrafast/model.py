@@ -55,6 +55,11 @@ def validate_choice(answer, ids):
     return answer
 
 
+def present(**fields):
+    """An attribute the page does not set arrives as an empty string; sending it is pure payload."""
+    return {key: value for key, value in fields.items() if value not in (None, "")}
+
+
 def action_space(actions):
     """One index per observed element; each operation has its own valid target choices."""
     elements, indices, targets, controls = [], {}, {}, {}
@@ -68,7 +73,9 @@ def action_space(actions):
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded") if k in action}
+            element = present(role=action.get("role"), value=action.get("value"), href=action.get("href"),
+                              checked=action.get("checked"), selected=action.get("selected"),
+                              expanded=action.get("expanded"))
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
                 element["value"] = action.get("current_value", "")
@@ -123,8 +130,9 @@ def build_request(state, goal, history):
             "criteria": {
                 index: {
                     "element": f"[{index}] {a['label']}",
-                    "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
+                    **present(current_value=a.get("current_value", a.get("value", "")),
+                              role=a.get("role"), href=a.get("href"), checked=a.get("checked"),
+                              selected=a.get("selected"), expanded=a.get("expanded")),
                 }
                 for index, a in candidates.items()
             },
@@ -140,6 +148,9 @@ def build_request(state, goal, history):
         "state": {
             "page": {k: state[k] for k in ("url", "title", "text")},
             **page_state,
+            # Dropping this copy (every element also appears in its target question) cuts the request by
+            # about a third and costs far more than it saves: measured 24 steps / 156 s against 7 / 24 s,
+            # because the policy loses the page view and starts scrolling and looking at random.
             "elements": elements,
             "recent_actions": [
                 {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
@@ -150,8 +161,11 @@ def build_request(state, goal, history):
     return body, targets, controls, operations
 
 
-def choose(state, goal, history):
+def choose(state, goal, history, cache_session=None, *, relative_tie=False):
     body, targets, controls, operations = build_request(state, goal, history)
+    if cache_session:
+        # A private namespace lets a self-hosted S1 reuse the stable goal prefix across turns.
+        body = {**body, "cache_session": cache_session}
     started = time.perf_counter()
     result = post_json(TYPESAFE_URL, os.environ["TYPESAFE_API_KEY"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
@@ -170,7 +184,12 @@ def choose(state, goal, history):
         target_answer = validate_choice(result["answers"].get(head, {}), targets[operation])
         target = target_answer["choice"]
         ranked = sorted(target_answer["probabilities"].items(), key=lambda item: -item[1])
-        if len(ranked) >= 2 and ranked[0][1] - ranked[1][1] < TIE_MARGIN:
+        gap = ranked[0][1] - ranked[1][1] if len(ranked) >= 2 else None
+        # The ratio cancels the softmax denominator: adding low-ranked candidates
+        # alone cannot trigger a retry. Keep the original harness policy as default.
+        if relative_tie and gap is not None:
+            gap /= max(ranked[0][1] + ranked[1][1], 1e-12)
+        if gap is not None and gap < TIE_MARGIN:
             # Near tie: ask System 1 again with only the two candidates. One extra request, never a loop.
             pair = {ranked[0][0], ranked[1][0]}
             criteria = {index: body["questions"][head]["criteria"][index] for index in pair}
@@ -178,7 +197,9 @@ def choose(state, goal, history):
             answer = post_json(TYPESAFE_URL, os.environ["TYPESAFE_API_KEY"], {**body, "questions": {"tie": tie}})
             tie_answer = validate_choice(answer["answers"].get("tie", {}), pair)
             tie_break = {"candidates": [ranked[0][0], ranked[1][0]], "first": target, "final": tie_answer["choice"],
-                         "probabilities": tie_answer["probabilities"]}
+                         "probabilities": tie_answer["probabilities"],
+                         "initial_probabilities": {k: p for k, p in ranked[:2]},
+                         "gap": gap, "relative": relative_tie}
             target = tie_answer["choice"]
         choice = targets[operation][target]["id"]
         probabilities = {a["id"]: target_answer["probabilities"][index] for index, a in targets[operation].items()}
@@ -299,7 +320,7 @@ def field_text(context):
     raise ValueError("Text helper returned no valid field value; nothing typed.")
 
 
-def reflect(goal, page, history, trigger):
+def reflect(goal, page, history, trigger, *, allow_done=True):
     """System 2: called only when System 1 is stuck. Returns a language subgoal or a stop reason, never an action."""
     context = {
         "goal": goal,
@@ -309,10 +330,16 @@ def reflect(goal, page, history, trigger):
         "elements": [e["label"] for e in action_space(page["actions"])[0]][:80],
         "recent_actions": [{k: h.get(k) for k in ("action", "text", "page_changed")} for h in history[-10:]],
     }
-    content, meta = text_model(REFLECT, context, env="S2_MODEL")
+    prompt = REFLECT
+    if not allow_done:
+        prompt += ("\nAn independent completion verifier has already failed. Do not return verdict=done; "
+                   "give a subgoal that addresses the failed checks or explain why the task is infeasible.")
+    content, meta = text_model(prompt, context, env="S2_MODEL")
     try:
         output = json.loads(content)
         if set(output) != {"verdict", "text"} or output["verdict"] not in {"subgoal", "infeasible", "done"}:
+            raise ValueError()
+        if output["verdict"] == "done" and not allow_done:
             raise ValueError()
         if not isinstance(output["text"], str) or not output["text"].strip() or len(output["text"]) > 500:
             raise ValueError()

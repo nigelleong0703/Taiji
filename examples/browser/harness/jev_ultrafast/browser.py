@@ -13,6 +13,18 @@ from browser_harness.helpers import cdp
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
+# Derived from the running Chrome's major version so the UA tracks the installed browser.
+def _headed_identity():
+    version = cdp("Browser.getVersion")["product"].split("/")[-1]
+    ua = (f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+          f"(KHTML, like Gecko) Chrome/{version} Safari/537.36")
+    metadata = {
+        "platform": "macOS", "platformVersion": "15.5.0", "platformArch": "arm",
+        "uaFullVersion": version, "architecture": "arm", "model": "", "mobile": False,
+        "bitness": "64", "wow64": False,
+    }
+    return ua, metadata
+
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
@@ -24,6 +36,11 @@ class Browser:
         self.target = cdp("Target.createTarget", url="about:blank", newWindow=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+        # Headless Chrome advertises `HeadlessChrome` in its UA, which bot filters (Trip.com's
+        # whaleguard among them) answer with HTTP 432 and an empty page. Present the same UA the
+        # headed browser sends so observed pages are the real ones.
+        ua, metadata = _headed_identity()
+        self.call("Emulation.setUserAgentOverride", userAgent=ua, userAgentMetadata=metadata)
         # Keep rAF/menus rendering when the owned window is behind the user's, without stealing their tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         self.call("Page.navigate", url=url)
@@ -43,8 +60,10 @@ class Browser:
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
+        input_happened = False
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
+            input_happened = True
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
             try:
                 self.call(
@@ -75,6 +94,12 @@ class Browser:
                 )
             except RuntimeError:
                 pass
+        if input_happened:
+            # A control can open a widget that renders well after the input: Google Flights' date picker
+            # paints its day grid and its Next/Previous arrows about a second later. Reading the page in
+            # that window shows a half-open picker, so the model sees no dates and no way to page. Wait for
+            # the page to stop changing first; a settled page returns almost immediately.
+            self.settle(quiet=0.15, limit=1.5)
         # A navigating document is a timing problem, not a decision: poll until a real page loads.
         deadline = time.monotonic() + 5
         while True:
@@ -161,7 +186,7 @@ def browser_operation(request):
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
-            target = evaluate("""(action => {
+            resolver = """(action => {
               const e=window.__jevFast?.nodes.get(action.node);
               if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
                   !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
@@ -177,11 +202,45 @@ def browser_operation(request):
                 e.dispatchEvent(new Event('change',{bubbles:true}));
               }
               return {x,y};
-            })(""" + json.dumps(action) + ")")
+            })(""" + json.dumps(action) + ")"
+            target = evaluate(resolver)
+            if target is None and kind in {"click", "fill"}:
+                # A date picker is often a horizontally scrolling strip: the month the goal needs is laid
+                # out past the clip window, so its centre point hits the clipping container instead of the
+                # cell and no click lands. Scroll to it the way a person would, then resolve again.
+                evaluate("""(action => {
+                  const e=window.__jevFast?.nodes.get(action.node);
+                  if (!e?.isConnected) return false;
+                  e.scrollIntoView({block:'nearest', inline:'center'});
+                  return true;
+                })(""" + json.dumps(action) + ")")
+                target = evaluate(resolver)
             if target is None:
                 if kind == "select":
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
-                raise StalePage("Target changed or is covered. Observe again.")
+                # A node we observed can be laid out but covered by another container: Google's date
+                # picker puts the whole trailing column (every Sunday) under the search-form layer, so
+                # a coordinate click is refused and the goal date can never be chosen. The node id is
+                # ours, never model-generated, so fall back to dispatching the click on the node itself.
+                landed = evaluate("""(action => {
+                  const e=window.__jevFast?.nodes.get(action.node);
+                  if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
+                      !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return false;
+                  const r=e.getBoundingClientRect();
+                  const opts={bubbles:true,cancelable:true,composed:true,view:window,
+                              clientX:r.x+r.width/2,clientY:r.y+r.height/2,button:0,buttons:1};
+                  e.dispatchEvent(new PointerEvent('pointerdown', opts));
+                  e.dispatchEvent(new MouseEvent('mousedown', opts));
+                  e.dispatchEvent(new PointerEvent('pointerup', opts));
+                  e.dispatchEvent(new MouseEvent('mouseup', opts));
+                  e.click();
+                  return true;
+                })(""" + json.dumps(action) + ")")
+                if not landed:
+                    raise StalePage("Target changed or is covered. Observe again.")
+                if kind == "fill":
+                    call("Input.insertText", text=request["text"])
+                return {"executed": action["id"]}
             if kind != "select":
                 x, y = target["x"], target["y"]
                 for event in ("mousePressed", "mouseReleased"):
