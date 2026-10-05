@@ -60,7 +60,7 @@ The restoration removes the backed-up files, the manifest, and all applied chang
 
 **Verification:**
 
-CPU-side tests run without GPU or vLLM:
+Unit tests run on CPU (they need `torch` and `pytest`, no GPU):
 
 ```bash
 cd inference && python -m pytest vllm_tests -q
@@ -240,7 +240,7 @@ makes it return JSON.
 ## Serve in FP8 on an 8 GB GPU
 
 On an RTX 4060 Laptop with vLLM 0.29.0 and the patched engine, FP8 per-tensor
-quantization keeps weights on device with full latency headroom. Weights are
+quantization fits the whole model on the GPU. Weights are
 quantized online at load time; the vision tower and generation head remain
 unquantized, KV cache is BF16, and the decision head is FP32. No CPU offload
 is needed. The checkpoint's full context length (262,144 tokens) is supported.
@@ -263,8 +263,8 @@ earlier conservative setting (`--max-num-batched-tokens 512 --max-num-seqs 1
 --enforce-eager`), decision latency improves: cold decisions ~480–760 ms become
 297–458 ms (38–40% faster p50/p90), cached repeats settle at ~213–240 ms. Memory
 footprint is slightly lower. Small decision differences appear only on near-tie
-options, reflecting FP8 accumulation order within the same hardware, not an
-accuracy drop; the same decision is returned in subsequent runs.
+options: FP8 accumulation order changes with batch size. This is not an accuracy
+drop.
 
 Check the health endpoint:
 
@@ -277,8 +277,8 @@ It returns `{"ok": true, "model": "taiji-vllm", "max_model_len": 262144,
 
 Prefix caching is enabled and shared by decisions and generation. The model is a
 hybrid Qwen3.5 (Gated DeltaNet + attention). vLLM caches prefixes at block
-granularity, so place stable prompt text (state, instructions) first to maximize
-cache hits on repeated questions.
+granularity, so put text that stays the same across steps (task, rules) first and
+the changing page text last to maximize cache hits.
 
 For comparison, the plain base model (stock Qwen3.5-2B with no Taiji head or
 patch) can be served for generation-only workloads with:
@@ -289,9 +289,9 @@ vllm serve Qwen/Qwen3.5-2B --max-model-len 32768 \
   --quantization fp8 --language-model-only
 ```
 
-## AORUS CUDA 13.0 environment
+## CUDA 13.0 environment
 
-The RTX 4060 laptop deployment uses a separate Linux Python environment; the
+The RTX 4060 Laptop deployment uses a separate Linux Python environment; the
 copied macOS `.venv` cannot run there. Install matching JIT compiler components
 with `pip install -r inference/requirements-vllm-cu130.txt`, then install the Taiji
 plugin with `pip install --no-deps -e ./inference` and apply
@@ -302,16 +302,13 @@ uv-managed Python 3.12 supplies it. Set `CUDA_HOME` to the environment's
 and `$CUDA_HOME/bin` on PATH for nvcc and ninja. Unconstrained toolkit extras
 selected nvcc 13.4 against cu130 headers and broke FlashInfer sampler JIT.
 
-`serve.py` accepts `--max-num-seqs` and `--enforce-eager` for limited VRAM.
-The AORUS launch uses `--max-len 8192 --gpu-memory-utilization 0.88
---max-num-batched-tokens 512 --max-num-seqs 1 --enforce-eager`. Eager mode
-avoids CUDA graph memory. These serving limits are independent of the
-checkpoint's native 262,144-token capacity. Image support remains enabled.
+`serve.py` accepts `--max-num-seqs` and `--enforce-eager` for limited VRAM; see
+[Serve in FP8 on an 8 GB GPU](#serve-in-fp8-on-an-8-gb-gpu) for the tested launch.
+`--enforce-eager` saves CUDA graph memory at a latency cost; with FP8 weights it
+is not needed on 8 GB. Image support remains enabled.
 Attention is FLASH_ATTN (version 2 on this GPU); FlashInfer can separately be
 used for sampling and other kernels, so the two names are not exclusive.
 
 For the pip CUDA toolkit layout, the isolated environment additionally needed
 `lib64 -> lib` and `lib/libcudart.so -> libcudart.so.13` before JIT linking.
 Verify sampling compilation/loading on its own before full engine startup.
-See [the AORUS handoff](handoffs/2026-10-02-aorus-vllm.md) for tested outcomes
-and remaining S1 execution failures.
